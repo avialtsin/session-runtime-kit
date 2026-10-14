@@ -26,7 +26,11 @@ def run(cmd, cwd=None, timeout=30, keep_indent=False):
 
 
 def short(path):
-    return str(path).replace(str(HOME), "~")
+    s = str(path)
+    for h in (str(HOME.resolve()), str(HOME)):
+        if s.startswith(h + "/"):
+            return "~" + s[len(h):]
+    return s
 
 
 def orca_json(*args):

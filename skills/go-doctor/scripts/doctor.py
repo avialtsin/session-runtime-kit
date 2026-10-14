@@ -27,6 +27,14 @@ def run(cmd, cwd=None, timeout=60):
         return 1, str(e)
 
 
+def short(path):
+    s = str(path)
+    for h in (str(HOME.resolve()), str(HOME)):
+        if s.startswith(h + "/"):
+            return "~" + s[len(h):]
+    return s
+
+
 def orca():
     return shutil.which("orca") or (str(ORCA_APP) if ORCA_APP.exists() else None)
 
@@ -40,7 +48,7 @@ def machine():
     if not pkg or not (pkg / "install.py").exists():
         bad.append("session-runtime не установлен: нет ссылки ~/.agents/skills/session-artifacts")
     else:
-        out.append("Пакет: `%s`" % str(pkg).replace(str(HOME), "~"))
+        out.append("Пакет: `%s`" % short(pkg))
         code, text = run([sys.executable, str(pkg / "install.py"), "--dry-run"])
         pending = [l for l in text.splitlines()[1:] if l.strip() and not l.startswith("есть")]
         fixes = {l.split()[1] for l in pending if l.startswith("убрано")}  # битые ссылки, которые уберёт установка
@@ -51,13 +59,13 @@ def machine():
             else:
                 bad.append("установка: " + l)
         if pending and any(l.split()[0] in ("создано", "заменено", "обновлено", "дописано", "убрано") for l in pending):
-            bad.append("установка отстала от пакета — `python3 %s/install.py`" % str(pkg).replace(str(HOME), "~"))
+            bad.append("установка отстала от пакета — `python3 %s/install.py`" % short(pkg))
     for base in SKILLS:
         if not base.is_dir():
             continue
         for p in sorted(base.iterdir()):
-            if p.is_symlink() and not p.exists() and str(p).replace(str(HOME), "~") not in fixes:
-                bad.append("битая ссылка скилла: `%s` → %s" % (str(p).replace(str(HOME), "~"), os.readlink(p)))
+            if p.is_symlink() and not p.exists() and short(p) not in fixes:
+                bad.append("битая ссылка скилла: `%s` → %s" % (short(p), os.readlink(p)))
     claude, agents = SKILLS[1], SKILLS[0]
     if claude.is_dir():
         for p in sorted(claude.iterdir()):
@@ -89,7 +97,7 @@ def stale_skills(agents_md):
 
 def project(path, base_ref):
     p = Path(path)
-    row = {"name": p.name, "path": str(p).replace(str(HOME), "~"), "notes": []}
+    row = {"name": p.name, "path": short(p), "notes": []}
     if not p.is_dir():
         row["notes"].append("папки нет — убрать из Orca или вернуть")
         row.update(agents="?", board="?", sessions="?", git="?", base="?")
@@ -150,11 +158,12 @@ def projects():
         return None, "Orca не найдена — список проектов брать неоткуда"
     code, text = run([o, "repo", "list", "--json"], timeout=30)
     try:
-        data = json.loads(text)
-        repos = data.get("result", data)
+        repos = json.loads(text)["result"]
         repos = repos.get("repos", repos) if isinstance(repos, dict) else repos
+        assert isinstance(repos, list)
     except Exception:
         return None, "Orca не ответила (`orca repo list`): открой Orca и повтори"
+    repos = [r for r in repos if isinstance(r, dict)]
     rows = [project(r.get("path", ""), r.get("worktreeBaseRef", "")) for r in repos if r.get("path")]
     return rows, None
 

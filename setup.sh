@@ -37,9 +37,6 @@ else
   step "Скачиваю пакет в $KIT"; git clone -q "$REPO_URL" "$KIT"
 fi
 
-step "Ставлю правила, скиллы и табло"
-python3 "$KIT/install.py"
-
 # Команды Orca для агента (вкладки, деревья, браузер): скилл orca-cli под версию своей Orca.
 ORCA="$(command -v orca || true)"
 [ -n "$ORCA" ] || ORCA=/Applications/Orca.app/Contents/Resources/bin/orca
@@ -53,6 +50,9 @@ if [ ! -e "$HOME/.agents/skills/orca-cli" ]; then
     echo "Orca не найдена — поставь Orca и запусти команду ещё раз."
   fi
 fi
+
+step "Ставлю правила, скиллы и табло"
+python3 "$KIT/install.py"
 
 step "Готово"
 echo "Открой новую вкладку Orca, запусти codex в папке проекта и скажи «go help»."
