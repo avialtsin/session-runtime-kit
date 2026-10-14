@@ -217,11 +217,15 @@ def install_gitignore():
 
 
 def check_tools():
+    # orca в PATH только во вкладках Orca; в обычном терминале — ищем в самом приложении.
+    app = Path("/Applications/Orca.app/Contents/Resources/bin/orca")
+    found = {t: shutil.which(t) for t in ("git", "claude", "orca", "backlog", "codex")}
+    found["orca"] = found["orca"] or (str(app) if app.exists() else None)
     for tool, why in [("git", "обязательно"), ("claude", "Claude Code"), ("orca", "вкладки и деревья"),
                       ("backlog", "доска задач: npm i -g backlog.md"), ("codex", "по желанию")]:
-        say("есть" if shutil.which(tool) else "НЕТ", tool, why)
+        say("есть" if found[tool] else "НЕТ", tool, why)
     # Команды Orca для агента (вкладки, деревья, браузер) — скиллы самой Orca, ставит она.
-    if shutil.which("orca") and not (HOME / ".agents" / "skills" / "orca-cli").exists():
+    if found["orca"] and not (HOME / ".agents" / "skills" / "orca-cli").exists():
         say("НЕТ", "скилл orca-cli", "orca skills install --skill orca-cli")
 
 
