@@ -14,6 +14,7 @@
                                    завести решение с шаблоном; заменить старое — пометить его
   go-board status decision-N <proposed|accepted|rejected|superseded>
                                    сменить статус решения
+  go-board drop decision-N         убрать мусорное решение (не решение, а мелочь) — по слову пользователя
   go-board find "<тема>"           решения и материалы по теме и весь список решений
 
 Запуск — из папки проекта (или любой вложенной). Нужна программа `backlog`.
@@ -50,6 +51,7 @@ TEMPLATE = """## Context
 
 - Что решили — по пунктам, языком продукта.
 - **Решил:** пользователь (дата, где сказал) | проджект за пользователя | агент в пределах задачи.
+- **Проверка:** как увидеть, что решение соблюдается: экран и куда нажать, команда, тест.
 
 ## Consequences
 
@@ -410,6 +412,19 @@ def status_cmd(r, args):
     print(f"{args[0]}: {args[1]}")
 
 
+def drop(r, args):
+    if not args:
+        die("go-board drop decision-N — только по слову пользователя")
+    f = decision_file(r, args[0])
+    meta, _ = front(f)
+    tracked = subprocess.run(["git", "ls-files", "--error-unmatch", str(f)], cwd=r, capture_output=True).returncode == 0
+    if tracked:
+        subprocess.run(["git", "rm", "-q", str(f)], cwd=r, check=True)
+    else:
+        f.unlink()
+    print(f"Убрано: {meta.get('id', args[0])} «{meta.get('title', '')}»" + (" (git rm; в истории git остаётся)" if tracked else ""))
+
+
 def find(r, args):
     if not args:
         die('go-board find "<тема>"')
@@ -429,7 +444,7 @@ def main():
     cmd, rest = (args[0], args[1:]) if args else ("", [])
     {"": lambda: summary(r), "open": lambda: open_board(r, rest), "stop": lambda: stop_board(r),
      "publish": lambda: publish(r, rest), "map": lambda: build_map(r), "decision": lambda: decision(r, rest),
-     "status": lambda: status_cmd(r, rest), "find": lambda: find(r, rest)}.get(
+     "status": lambda: status_cmd(r, rest), "drop": lambda: drop(r, rest), "find": lambda: find(r, rest)}.get(
         cmd, lambda: die(f"нет команды {cmd} — go-board help"))()
 
 
