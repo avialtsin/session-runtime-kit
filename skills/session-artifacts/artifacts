@@ -2,8 +2,8 @@
 """Табло сессии — паспорт и краткая история сессии агента (скилл session-artifacts).
 
 Файл sessions/NNN-ДДММГГ_Тема/artifacts.md в рабочем дереве вкладки Orca, коммитится вместе с
-работой; в проекте без sessions/ — временный, в .artifacts/. Простой markdown: сверху «Сейчас»,
-«Смотреть», «Дальше», «Зачем»; ниже — только непустые разделы. Верх табло показывает строка внизу
+работой; в git-проекте без sessions/ папка заводится сама, вне git — временный, в .artifacts/.
+Простой markdown: сверху «Сейчас», «Смотреть», «Дальше», «Зачем»; ниже — только непустые разделы. Верх табло показывает строка внизу
 вкладки Claude; хуки Claude Code сами пишут просьбы и кадры пользователя, коммиты, задачи доски,
 кадры агента, сводки Claude Code и то, что агент делает сейчас.
 Правила — ~/.agents/skills/session-artifacts/SKILL.md.
@@ -603,7 +603,8 @@ def cmd_init(args):
         print(old)
         return
     now = datetime.now()
-    if (root / "sessions").is_dir():
+    # В git-проекте папка сессий заводится сама; вне git — временное табло в .artifacts/.
+    if (root / "sessions").is_dir() or git(root, "rev-parse", "--show-toplevel"):
         n = next_session_number(root)
         folder = root / "sessions" / f"{n:03d}-{now:%d%m%y}_{slug(title)}"
         folder.mkdir(parents=True)
