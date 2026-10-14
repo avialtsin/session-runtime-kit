@@ -28,6 +28,9 @@ LOCAL = HOME / ".agents" / "session-runtime"  # своё для этой маш�
 BACKUP = LOCAL / "backup" / datetime.now().strftime("%y%m%d-%H%M%S")
 BEGIN = "<!-- session-runtime:begin"
 END = "<!-- session-runtime:end -->"
+# Версия Backlog.md, на которой проверены доска, решения и документы (скилл go-board). Обновлять —
+# после проверки на временной доске (README, «Backlog.md»); setup.sh пакета берёт её отсюда.
+BACKLOG_VERSION = "1.52.0"
 ARTIFACTS = '"$HOME/.agents/skills/session-artifacts/artifacts"'
 STATUSLINE = 'bash "$HOME/.agents/skills/session-artifacts/statusline.sh"'
 HOOKS = [("UserPromptSubmit", None, "prompt", {}), ("SessionStart", None, "start", {}),
@@ -222,8 +225,13 @@ def check_tools():
     found = {t: shutil.which(t) for t in ("git", "claude", "orca", "backlog", "codex")}
     found["orca"] = found["orca"] or (str(app) if app.exists() else None)
     for tool, why in [("git", "обязательно"), ("claude", "Claude Code"), ("orca", "вкладки и деревья"),
-                      ("backlog", "доска задач: npm i -g backlog.md"), ("codex", "по желанию")]:
+                      ("backlog", f"доска задач: bun add -g backlog.md@{BACKLOG_VERSION}"), ("codex", "по желанию")]:
         say("есть" if found[tool] else "НЕТ", tool, why)
+    if found["backlog"]:
+        p = subprocess.run([found["backlog"], "--version"], capture_output=True, text=True)
+        have = (p.stdout or "").strip()
+        if have != BACKLOG_VERSION:
+            say("ВНИМАНИЕ", f"backlog {have or '?'}", f"пакет проверен на {BACKLOG_VERSION} — сверь по README, раздел «Backlog.md»")
     # Команды Orca для агента (вкладки, деревья, браузер) — скиллы самой Orca, ставит она.
     if found["orca"] and not (HOME / ".agents" / "skills" / "orca-cli").exists():
         say("НЕТ", "скилл orca-cli", "orca skills install --skill orca-cli")

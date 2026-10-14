@@ -1651,6 +1651,21 @@ def hook_locked(event, data, root):
                 add(b, "Заведено за сессию", f"{m.group(1)} {title}".strip())
                 log(b, "＋", f"на доску: {m.group(1)} {title}".strip())
                 changed = True
+        # Решения и материалы доски (скилл go-board) — в табло сами, с номером.
+        run_at = r"(?:^|[;&|(]\s*|\bthen\s+)(?:\S*/)?"  # сама команда, а не её текст в grep или printf
+        if re.search(run_at + r"(?:backlog\s+decision\s+create|go-board\s+decision)\b", cmd, re.M):
+            m = re.search(r"Решение (decision-\d+)", out) or re.search(r"\b(decision-\d+)\b", out)
+            if m:
+                t = re.search(r"(?:create|decision)\s+(?:\"([^\"]+)\"|'([^']+)')", cmd)
+                title = (t.group(1) or t.group(2)) if t else ""
+                add(b, "Решения", f"{m.group(1)} {title} — на доске".strip())
+                log(b, "⚖", f"решение на доску: {m.group(1)} {title}".strip())
+                changed = True
+        if re.search(run_at + r"go-board\s+publish\b", cmd, re.M):
+            m = re.search(r"(Выложено|Обновлено): (doc-\d+) «([^»]*)»", out)
+            if m:
+                log(b, "📄", f"материал на доску: {m.group(2)} {m.group(3)} ({m.group(1).lower()})")
+                changed = True
         f = opened_file(cmd, out, cwd)
         if f and f.resolve() != board.resolve():
             target = str(f.resolve())

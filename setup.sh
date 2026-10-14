@@ -1,8 +1,8 @@
 #!/bin/bash
 # Поставить session-runtime-kit на Mac одной командой — с нуля или поверх, повторный запуск обновляет:
 #   bash -c "$(curl -fsSL --retry 5 --retry-all-errors https://raw.githubusercontent.com/avialtsin/session-runtime-kit/main/setup.sh)"
-# Всё — в домашнюю папку, без пароля: доска Backlog.md (готовый файл с GitHub), скилл orca-cli (из самой
-# Orca), пакет в ~/session-runtime-kit и его install.py. Уже стоящее не трогает.
+# Всё — в домашнюю папку, без пароля: пакет в ~/session-runtime-kit, доска Backlog.md (готовый файл с
+# GitHub, проверенной версии), скилл orca-cli (из самой Orca) и install.py пакета. Уже стоящее не трогает.
 set -euo pipefail
 
 REPO_URL="${KIT_REPO:-https://github.com/avialtsin/session-runtime-kit.git}"
@@ -23,22 +23,25 @@ mkdir -p "$BIN"
 export PATH="$BIN:$PATH"
 grep -qsF '.local/bin' "$HOME/.zshrc" || printf '\n# Команды агентов (artifacts, backlog)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
 
-if ! have backlog; then
-  step "Ставлю доску задач Backlog.md"
-  arch="$( [ "$(uname -m)" = arm64 ] && echo arm64 || echo x64 )"
-  # Сеть до GitHub иногда рвётся: повторы, и файл встаёт на место только целиком.
-  tmp="$(mktemp)"
-  curl -fL --retry 4 --retry-all-errors --retry-delay 2 --progress-bar -o "$tmp" \
-    "https://github.com/MrLesk/Backlog.md/releases/latest/download/backlog-bun-darwin-$arch"
-  chmod +x "$tmp" && mv "$tmp" "$BIN/backlog"
-fi
-
 if [ -d "$KIT/.git" ]; then
   step "Обновляю пакет в $KIT"
   git -C "$KIT" pull -q --ff-only || { sleep 3; git -C "$KIT" pull -q --ff-only; }
 else
   step "Скачиваю пакет в $KIT"
   git clone -q "$REPO_URL" "$KIT" || { sleep 3; rm -rf "$KIT"; git clone -q "$REPO_URL" "$KIT"; }
+fi
+
+# Backlog.md — той версии, на которой пакет проверен (BACKLOG_VERSION в install.py); новее — по README.
+if ! have backlog; then
+  ver="$(sed -n 's/^BACKLOG_VERSION = "\(.*\)"$/\1/p' "$KIT/install.py")"
+  step "Ставлю доску задач Backlog.md ${ver:-последней версии}"
+  arch="$( [ "$(uname -m)" = arm64 ] && echo arm64 || echo x64 )"
+  url="https://github.com/MrLesk/Backlog.md/releases/${ver:+download/v$ver}"
+  [ -n "$ver" ] || url="${url}latest/download"
+  # Сеть до GitHub иногда рвётся: повторы, и файл встаёт на место только целиком.
+  tmp="$(mktemp)"
+  curl -fL --retry 4 --retry-all-errors --retry-delay 2 --progress-bar -o "$tmp" "$url/backlog-bun-darwin-$arch"
+  chmod +x "$tmp" && mv "$tmp" "$BIN/backlog"
 fi
 
 # Команды Orca для агента (вкладки, деревья, браузер): скилл orca-cli под версию своей Orca.

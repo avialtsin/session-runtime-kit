@@ -86,7 +86,23 @@ def board(root):
             out += ["- " + i for i in items[:limit]]
             out.append("")
     if len(out) == 2:
-        out.append("Задач нет.")
+        out += ["Задач нет.", ""]
+    # Решения доски (скилл go-board): ждущие слова пользователя и последние принятые.
+    code, text = run(["backlog", "decision", "list", "--json"], cwd=str(root))
+    try:
+        ds = json.loads(text).get("decisions", []) if not code else []
+    except ValueError:
+        ds = []
+    wait = [d for d in ds if d.get("status") == "proposed"]
+    last = sorted([d for d in ds if d.get("status") == "accepted"], key=lambda d: d.get("date", ""))[-3:]
+    if wait:
+        out.append("**Решения ждут слова пользователя** (%d):" % len(wait))
+        out += ["- %s %s" % (d["id"], d["title"]) for d in wait[:5]]
+        out.append("")
+    if last:
+        out.append("**Последние решения** (всего %d, `go-board find`):" % len(ds))
+        out += ["- %s %s" % (d["id"], d["title"]) for d in reversed(last)]
+        out.append("")
     return out
 
 

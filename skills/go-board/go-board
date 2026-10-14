@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""go-board — доска проекта как одно место: задачи, материалы, идеи, решения (скилл go-board).
+
+  go-board                         сводка: в работе, решения ждут слова, свежие материалы и идеи
+  go-board open [--port N] [--no-tab]
+                                   веб-доска проекта на свободном порту; в Orca — сразу вкладкой
+  go-board stop                    погасить веб-доску проекта
+  go-board publish <файл.md> [--topic <папка>] [--doc doc-N] [--title "…"] [--status "…"] [--task TASK-N]
+                                   выложить материал из сессии в документ доски поверх прошлой версии;
+                                   картинки — в backlog/assets/, карта материалов — заново
+  go-board map                     собрать документ «Карта материалов» заново
+  go-board decision "<решение одной фразой>" [--status proposed|accepted|rejected]
+                   [--replaces decision-N [--part "<какой пункт>"]] [--task TASK-N]
+                                   завести решение с шаблоном; заменить старое — пометить его
+  go-board status decision-N <proposed|accepted|rejected|superseded>
+                                   сменить статус решения
+  go-board find "<тема>"           решения и материалы по теме и весь список решений
+
+Запуск — из папки проекта (или любой вложенной). Нужна программа `backlog`.
+Правила — SKILL.md рядом.
+"""
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+STATUSES = ("proposed", "accepted", "rejected", "superseded")
+MAP_TITLE = "Карта материалов"
+IDEAS = ("идеи", "product-backlog")  # папки идей: новая и прежняя
+IMAGE = re.compile(r"\.(png|jpe?g|gif|webp|svg|avif)$", re.I)
+TEMPLATE = """## Context
+
+Кто и в какой ситуации, что не так, почему решаем сейчас. Слово пользователя — цитатой с датой.
+Откуда: {source}
+
+## Alternatives
+
+- Вариант A — чем хорош, чем плох.
+- Вариант B — …
+
+## Decision
+
+- Что решили — по пунктам, языком продукта.
+- **Решил:** пользователь (дата, где сказал) | проджект за пользователя | агент в пределах задачи.
+
+## Consequences
+
+- Что меняем, что теперь нельзя, чем платим.
+- **Пересмотреть, если:** условие, при котором вернёмся к решению.
+"""
+
+
+def die(msg):
+    sys.exit(f"go-board: {msg}")
+
+
+def root():
+    p = Path.cwd().resolve()
+    for d in (p, *p.parents):
+        if (d / "backlog").is_dir():
+            return d
+    die("здесь нет доски Backlog.md (папки backlog/) — запусти из папки проекта")
+
+
+def backlog(r, *args):
+    if not shutil.which("backlog"):
+        die("нет программы backlog — поставь её (скилл go-board, раздел «Версия»)")
+    p = subprocess.run(["backlog", *args], cwd=r, capture_output=True, text=True)
+    if p.returncode:
+        die(f"backlog {' '.join(args[:2])}: {(p.stderr or p.stdout).strip()}")
+    return p.stdout
+
+
+# ---------- файлы доски ----------
+
+def front(path):
+    """Шапка markdown-файла доски: простые ключи, строки в кавычках, >- с переносом, списки."""
+    text = path.read_text(encoding="utf-8")
+    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+    if not m:
+        return {}, text
+    data, key = {}, None
+    for line in m.group(1).splitlines():
+        km = re.match(r"^([A-Za-z_]+):\s*(.*)$", line)
+        if km:
+            key, val = km.group(1), km.group(2).strip()
+            if val in (">-", ">", "|", "|-"):
+                data[key] = ""
+            elif val == "":
+                data[key] = []
+            else:
+                data[key] = unquote(val)
+        elif key and re.match(r"^\s+- ", line) and isinstance(data.get(key), list):
+            data[key].append(unquote(line.strip()[2:]))
+        elif key and line.startswith(" ") and isinstance(data.get(key), str):
+            data[key] = (data[key] + " " + line.strip()).strip()
+    return data, m.group(2)
+
+
+def unquote(v):
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        return v[1:-1]
+    return v
+
+
+def docs(r):
+    out = []
+    for f in sorted((r / "backlog" / "docs").rglob("*.md")):
+        meta, body = front(f)
+        if not meta.get("id"):
+            continue
+        first = next((l for l in body.splitlines() if l.strip()), "")
+        out.append({"id": meta["id"], "title": meta.get("title", f.stem), "file": f,
+                    "folder": "" if f.parent == r / "backlog" / "docs" else str(f.parent.relative_to(r / "backlog" / "docs")),
+                    "updated": meta.get("updated_date") or meta.get("created_date", ""),
+                    "head": first if first.startswith("**Статус:**") else ""})
+    return out
+
+
+def num(doc_id):
+    return re.sub(r"\D", "", doc_id) or doc_id
+
+
+def head_part(head, name):
+    m = re.search(r"\*\*" + name + r":\*\*\s*([^·]+)", head)
+    return m.group(1).strip() if m else ""
+
+
+def decision_file(r, did):
+    n = num(did)
+    for f in (r / "backlog" / "decisions").glob("decision-*.md"):
+        if re.match(r"decision-0*" + n + r"(\D|$)", f.name):
+            return f
+    die(f"нет решения {did}")
+
+
+def decisions(r):
+    data = json.loads(backlog(r, "decision", "list", "--json"))
+    return data.get("decisions", [])
+
+
+# ---------- команды ----------
+
+def summary(r):
+    print(f"Доска: {r.name}\n")
+    tasks = backlog(r, "task", "list", "--status", "In Progress", "--plain").strip()
+    print(tasks if tasks and "No tasks" not in tasks else "В работе: ничего")
+    ds = decisions(r)
+    wait = [d for d in ds if d["status"] == "proposed"]
+    print(f"\nРешения: {len(ds)}" + (f", ждут слова пользователя — {len(wait)}:" if wait else ""))
+    for d in wait:
+        print(f"  {d['id']} — {d['title']}")
+    last = sorted([d for d in ds if d["status"] == "accepted"], key=lambda d: d.get("date", ""))[-3:]
+    if last:
+        print("Последние принятые:")
+        for d in reversed(last):
+            print(f"  {d['id']} — {d['title']}")
+    ds_ = [d for d in docs(r) if d["title"] != MAP_TITLE]
+    ideas = [d for d in ds_ if d["folder"].split("/")[0] in IDEAS]
+    mats = [d for d in ds_ if d not in ideas]
+    print(f"\nМатериалы: {len(mats)}" + (", свежие:" if mats else ""))
+    for d in sorted(mats, key=lambda d: d["updated"])[-5:][::-1]:
+        st = head_part(d["head"], "Статус")
+        print(f"  {d['id']} {d['folder'] + '/' if d['folder'] else ''}{d['title']}" + (f" — {st}" if st else ""))
+    if ideas:
+        counts = {}
+        for d in ideas:
+            st = head_part(d["head"], "Статус") or "без статуса"
+            counts[st] = counts.get(st, 0) + 1
+        print(f"Идеи: {len(ideas)} — " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    print("\nПосмотреть глазами: go-board open")
+
+
+def state_file(r):
+    return r / ".artifacts" / "go-board.json"
+
+
+def alive(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/version", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def free_port(start):
+    for port in range(start, start + 200):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    die("нет свободного порта")
+
+
+def open_board(r, args):
+    st = state_file(r)
+    if st.exists():
+        old = json.loads(st.read_text(encoding="utf-8"))
+        if alive(old["port"]):
+            url = f"http://127.0.0.1:{old['port']}"
+            print(f"Доска уже открыта: {url}")
+            return tab(url, args)
+    port = int(args[args.index("--port") + 1]) if "--port" in args else free_port(6420)
+    st.parent.mkdir(parents=True, exist_ok=True)
+    log = open(st.parent / "go-board.log", "w")
+    p = subprocess.Popen(["backlog", "browser", "--no-open", "--port", str(port)], cwd=r,
+                         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(40):
+        if alive(port):
+            break
+        if p.poll() is not None:
+            die(f"веб-доска не поднялась: {(st.parent / 'go-board.log').read_text()[-400:]}")
+        time.sleep(0.5)
+    else:
+        die("веб-доска не ответила за 20 секунд")
+    st.write_text(json.dumps({"pid": p.pid, "port": port}), encoding="utf-8")
+    url = f"http://127.0.0.1:{port}"
+    print(f"Доска: {url}\nРешения — раздел Decisions слева, материалы и идеи — Documents. Погасить: go-board stop")
+    tab(url, args)
+
+
+def tab(url, args):
+    # В Orca — сразу вкладкой браузера рядом; вне Orca адреса хватает.
+    if "--no-tab" in args or not os.environ.get("ORCA_TERMINAL_HANDLE"):
+        return
+    orca = shutil.which("orca") or "/Applications/Orca.app/Contents/Resources/bin/orca"
+    if os.path.exists(orca):
+        subprocess.run([orca, "tab", "create", "--url", url], capture_output=True)
+
+
+def stop_board(r):
+    st = state_file(r)
+    if not st.exists():
+        return print("Веб-доска этого проекта не открыта.")
+    old = json.loads(st.read_text(encoding="utf-8"))
+    try:
+        os.killpg(old["pid"], signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    for _ in range(10):
+        if not alive(old["port"]):
+            break
+        time.sleep(0.3)
+    st.unlink()
+    print(f"Погашена: порт {old['port']}" + (" (ещё отвечает — проверь lsof)" if alive(old["port"]) else ""))
+
+
+def opt(args, name, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def stem_of(path):
+    return re.sub(r"_v\d+$", "", Path(path).stem)
+
+
+def publish(r, args):
+    if not args or args[0].startswith("--"):
+        die("укажи файл: go-board publish sessions/NNN-…/тема_vN.md --topic <папка>")
+    src = Path(args[0]).resolve()
+    if not src.is_file():
+        die(f"нет файла {args[0]}")
+    rel = os.path.relpath(src, r)
+    text = src.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    h1 = next((i for i, l in enumerate(lines) if l.strip()), None)
+    title = opt(args, "--title")
+    if h1 is not None and lines[h1].startswith("# "):
+        title = title or re.sub(r"\s*\((?:v\d+|черновик)[^)]*\)\s*$", "", lines[h1][2:].strip())
+        lines = lines[:h1] + lines[h1 + 1:]  # заголовок покажет сама доска
+    title = title or stem_of(src).replace("-", " ").replace("_", " ")
+    # Найти прежнюю версию: --doc или документ, выложенный из того же материала (тема_vN без версии).
+    existing = docs(r)
+    doc = opt(args, "--doc")
+    target = next((d for d in existing if doc and num(d["id"]) == num(doc)), None) if doc else \
+        next((d for d in existing if head_part(d["head"], "Откуда") and
+              stem_of(head_part(d["head"], "Откуда")) == stem_of(src)), None)
+    if doc and not target:
+        die(f"нет документа {doc}")
+    topic = opt(args, "--topic") or (target["folder"] if target else None)
+    if not target and not topic:
+        die("новый материал — укажи папку темы: --topic <папка>")
+    body = copy_images(r, src, "\n".join(lines).strip() + "\n", topic or "общее")
+    task = opt(args, "--task") or (head_part(target["head"], "Задача") if target else "")
+    status = opt(args, "--status") or (head_part(target["head"], "Статус") if target else "") or "рабочая"
+    head = f"**Статус:** {status} · **Откуда:** {rel} · **Обновлено:** {datetime.now():%d.%m.%Y}" + \
+        (f" · **Задача:** {task}" if task else "")
+    if target:
+        did = target["id"]
+    else:
+        out = backlog(r, "doc", "create", title, "-p", topic, "-t", "other", "--plain")
+        m = re.search(r"\b(doc-\d+)\b", out)
+        if not m:
+            die(f"не понял ответ backlog doc create: {out.strip()}")
+        did = m.group(1)
+    backlog(r, "doc", "update", did, "--content", head + "\n\n" + body)
+    if target and opt(args, "--title"):
+        backlog(r, "doc", "update", did, "--title", title)
+    print(f"{'Обновлено' if target else 'Выложено'}: {did} «{title}» — /documentation/{num(did)}")
+    build_map(r, quiet=True)
+
+
+def copy_images(r, src, body, topic):
+    assets = r / "backlog" / "assets" / topic
+    copied = []
+
+    def repl(m):
+        bang, alt, link = m.group(1), m.group(2), m.group(3).strip().strip("<>")
+        if re.match(r"^(https?:|/|#|mailto:)", link) or not IMAGE.search(link.split("#")[0]):
+            return m.group(0)
+        f = (src.parent / link).resolve()
+        if not f.is_file():
+            return m.group(0)
+        assets.mkdir(parents=True, exist_ok=True)
+        dst = assets / f.name
+        if dst.exists() and dst.read_bytes() != f.read_bytes():
+            dst = assets / f"{f.stem}-{abs(hash(str(f))) % 10000}{f.suffix}"
+        if not dst.exists():
+            shutil.copy2(f, dst)
+        copied.append(dst.name)
+        return f"{bang}[{alt}](</assets/{topic}/{dst.name}>)"
+
+    body = re.sub(r"(!?)\[([^\]]*)\]\(([^)]+)\)", repl, body)
+    if copied:
+        print(f"Картинки: {len(copied)} → backlog/assets/{topic}/")
+    return body
+
+
+def build_map(r, quiet=False):
+    items = [d for d in docs(r) if d["title"] != MAP_TITLE]
+    groups = {}
+    for d in items:
+        groups.setdefault(d["folder"] or "без папки", []).append(d)
+    out = ["Все материалы и идеи проекта по папкам. Собирается сама при каждой публикации (`go-board publish`);",
+           "руками не править. Решения — раздел Decisions слева.", ""]
+    for folder in sorted(groups, key=lambda f: (f.split("/")[0] in IDEAS, f)):
+        out += [f"## {folder}", "", "| Материал | Статус | Откуда | Задача |", "| --- | --- | --- | --- |"]
+        for d in sorted(groups[folder], key=lambda d: d["title"]):
+            cell = lambda v: (v or "—").replace("|", "/")
+            out.append(f"| [{cell(d['title'])}](/documentation/{num(d['id'])}) | {cell(head_part(d['head'], 'Статус'))} "
+                       f"| {cell(head_part(d['head'], 'Откуда'))} | {cell(head_part(d['head'], 'Задача'))} |")
+        out.append("")
+    mp = next((d for d in docs(r) if d["title"] == MAP_TITLE), None)
+    if not mp:
+        m = re.search(r"\b(doc-\d+)\b", backlog(r, "doc", "create", MAP_TITLE, "-t", "readme", "--plain"))
+        mp = {"id": m.group(1)}
+    backlog(r, "doc", "update", mp["id"], "--content", "\n".join(out).strip() + "\n")
+    if not quiet:
+        print(f"Карта: {mp['id']} — /documentation/{num(mp['id'])}, материалов {len(items)}")
+
+
+def write_body(f, body):
+    # Текст и статус решения CLI 1.52 не меняет — правим файл сами; шапку (id, date) не трогаем.
+    text = f.read_text(encoding="utf-8")
+    m = re.match(r"^(---\n.*?\n---\n)", text, re.S)
+    f.write_text(m.group(1) + body.lstrip("\n"), encoding="utf-8")
+
+
+def set_status(f, status):
+    text = f.read_text(encoding="utf-8")
+    text = re.sub(r"^status:.*$", f"status: {status}", text, count=1, flags=re.M)
+    f.write_text(text, encoding="utf-8")
+
+
+def decision(r, args):
+    if not args or args[0].startswith("--"):
+        die('укажи решение одной фразой: go-board decision "<что решили>"')
+    status = opt(args, "--status", "accepted")
+    if status not in STATUSES[:3]:
+        die(f"статус нового решения — {', '.join(STATUSES[:3])}")
+    out = backlog(r, "decision", "create", args[0], "-s", status, "--plain")
+    m = re.search(r"\b(decision-\d+)\b", out)
+    if not m:
+        die(f"не понял ответ backlog decision create: {out.strip()}")
+    did, f = m.group(1), decision_file(r, m.group(1))
+    task = opt(args, "--task")
+    old, part = opt(args, "--replaces"), opt(args, "--part")
+    body = TEMPLATE.format(source=(task or "TASK-…") + ", sessions/NNN-…/разбор_vN.md")
+    if old:
+        of = decision_file(r, old)
+        what = f"пункт «{part}»" if part else "целиком"
+        body = body.replace("- **Решил:**", f"- **Заменяет:** [{old}](/decisions/{num(old)}), {what}.\n- **Решил:**")
+        _, ob = front(of)
+        mark = f"**{'Частично заменено' if part else 'Заменено'}:** [{did}](/decisions/{num(did)}) " \
+               f"({datetime.now():%d.%m.%Y})" + (f", пункт «{part}»" if part else "") + "\n\n"
+        write_body(of, mark + ob)
+        if not part:
+            set_status(of, "superseded")
+        print(f"{old}: {'отмечен частично заменённым' if part else 'статус superseded'}, ссылка на {did}")
+    write_body(f, body)
+    print(f"Решение {did}: {f.relative_to(r)}\nЗаполни текст по шаблону (разделы на английском — их понимает доска).")
+
+
+def status_cmd(r, args):
+    if len(args) < 2 or args[1] not in STATUSES:
+        die(f"go-board status decision-N <{'|'.join(STATUSES)}>")
+    f = decision_file(r, args[0])
+    set_status(f, args[1])
+    print(f"{args[0]}: {args[1]}")
+
+
+def find(r, args):
+    if not args:
+        die('go-board find "<тема>"')
+    q = " ".join(args)
+    out = backlog(r, "search", q, "--type", "decision,document", "--plain").strip()
+    print(out or f"По «{q}» в решениях и материалах ничего. Поиск не знает словоформ — попробуй другую форму слова.")
+    print("\nВсе решения (заголовок и есть решение):")
+    for d in decisions(r):
+        print(f"  {d['id']} [{d['status']}] {d['title']}")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        return print(__doc__.strip())
+    r = root()
+    cmd, rest = (args[0], args[1:]) if args else ("", [])
+    {"": lambda: summary(r), "open": lambda: open_board(r, rest), "stop": lambda: stop_board(r),
+     "publish": lambda: publish(r, rest), "map": lambda: build_map(r), "decision": lambda: decision(r, rest),
+     "status": lambda: status_cmd(r, rest), "find": lambda: find(r, rest)}.get(
+        cmd, lambda: die(f"нет команды {cmd} — go-board help"))()
+
+
+if __name__ == "__main__":
+    main()
