@@ -26,15 +26,19 @@ grep -qsF '.local/bin' "$HOME/.zshrc" || printf '\n# Команды агенто
 if ! have backlog; then
   step "Ставлю доску задач Backlog.md"
   arch="$( [ "$(uname -m)" = arm64 ] && echo arm64 || echo x64 )"
-  curl -fL --progress-bar -o "$BIN/backlog" \
+  # Сеть до GitHub иногда рвётся: повторы, и файл встаёт на место только целиком.
+  tmp="$(mktemp)"
+  curl -fL --retry 4 --retry-all-errors --retry-delay 2 --progress-bar -o "$tmp" \
     "https://github.com/MrLesk/Backlog.md/releases/latest/download/backlog-bun-darwin-$arch"
-  chmod +x "$BIN/backlog"
+  chmod +x "$tmp" && mv "$tmp" "$BIN/backlog"
 fi
 
 if [ -d "$KIT/.git" ]; then
-  step "Обновляю пакет в $KIT"; git -C "$KIT" pull -q --ff-only
+  step "Обновляю пакет в $KIT"
+  git -C "$KIT" pull -q --ff-only || { sleep 3; git -C "$KIT" pull -q --ff-only; }
 else
-  step "Скачиваю пакет в $KIT"; git clone -q "$REPO_URL" "$KIT"
+  step "Скачиваю пакет в $KIT"
+  git clone -q "$REPO_URL" "$KIT" || { sleep 3; rm -rf "$KIT"; git clone -q "$REPO_URL" "$KIT"; }
 fi
 
 # Команды Orca для агента (вкладки, деревья, браузер): скилл orca-cli под версию своей Orca.
