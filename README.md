@@ -9,7 +9,7 @@
 Нужны Orca и Codex. Остальное команда поставит сама, в домашнюю папку и без пароля:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/avialtsin/session-runtime-kit/main/setup.sh)"
+bash -c "$(curl -fsSL --retry 5 --retry-all-errors https://raw.githubusercontent.com/avialtsin/session-runtime-kit/main/setup.sh)"
 ```
 
 Что она делает:

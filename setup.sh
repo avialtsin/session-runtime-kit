@@ -1,6 +1,6 @@
 #!/bin/bash
 # Поставить session-runtime-kit на Mac одной командой — с нуля или поверх, повторный запуск обновляет:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/avialtsin/session-runtime-kit/main/setup.sh)"
+#   bash -c "$(curl -fsSL --retry 5 --retry-all-errors https://raw.githubusercontent.com/avialtsin/session-runtime-kit/main/setup.sh)"
 # Всё — в домашнюю папку, без пароля: доска Backlog.md (готовый файл с GitHub), скилл orca-cli (из самой
 # Orca), пакет в ~/session-runtime-kit и его install.py. Уже стоящее не трогает.
 set -euo pipefail
