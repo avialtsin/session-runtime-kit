@@ -1,0 +1,1730 @@
+#!/usr/bin/env python3
+"""Табло сессии — паспорт и краткая история сессии агента (скилл session-artifacts).
+
+Файл sessions/NNN-ДДММГГ_Тема/artifacts.md в рабочем дереве вкладки Orca, коммитится вместе с
+работой; в проекте без sessions/ — временный, в .artifacts/. Простой markdown: сверху «Сейчас»,
+«Смотреть», «Дальше», «Зачем»; ниже — только непустые разделы. Верх табло показывает строка внизу
+вкладки Claude; хуки Claude Code сами пишут просьбы и кадры пользователя, коммиты, задачи доски,
+кадры агента, сводки Claude Code и то, что агент делает сейчас.
+Правила — ~/.agents/skills/session-artifacts/SKILL.md.
+
+Агент:
+  artifacts init "<тема>"                     завести папку сессии и табло (после «да» на план)
+  artifacts why "<зачем>"                     смысл сессии языком продукта
+  artifacts ask "<коротко>" [--shot <кадр>]   по желанию: решение пользователя своими словами (просьбы
+                                              и кадры из чата табло пишет само)
+  artifacts stage "<этап>"                    что происходит сейчас, коротко (до ~40 знаков)
+  artifacts next "<что дальше>"
+  artifacts link <url|файл> ["<подпись>"]     в «Смотреть», новое — первым; --drop <N> | --clear
+  artifacts now TASK-N | "<что делаем>"       задача (название — с доски)
+  artifacts queue TASK-N | "<что>"            в очередь;  artifacts queue --done <N>
+  artifacts problem "<что не так>" [<кадр>]   находка проверки;  artifacts fixed <N>
+  artifacts decision "<что решили — почему>"
+  artifacts done "<что сделано>"              в «Итог», языком продукта
+  artifacts shot <кадр> "<подпись>" [--key]   кадр в галерею (посмотренные попадают сами); --key — ещё
+                                              и в табло (в git)
+  artifacts path | gallery                    путь к табло | к галерее кадров
+Claude Code:
+  artifacts statusline                        строки внизу вкладки (JSON сессии на stdin)
+  artifacts hook prompt|pre|tool|stop|start   хуки (JSON события на stdin)
+"""
+import base64
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BOARD_NAME = "artifacts.md"
+BOARD_NAMES = (BOARD_NAME, "артефакты.md")  # прежнее имя — у табло, заведённых до 07.10 19:20
+SHOTS = "shots"
+# Порядок разделов; пустые на табло не пишутся. «Ход сессии» — по этапам, новые сверху.
+SECTIONS = ["Итог", "Решения", "Находки", "Очередь", "Заведено за сессию", "Ход сессии"]
+SECTION_ALIASES = {"Сделано": "Итог"}  # прежнее имя раздела
+MAX_LINKS = 3
+SKILL_MD = Path(__file__).resolve().parent / "SKILL.md"
+QUOTE_LEN = 220  # просьба пользователя на табло — начало его текста, без пересказа
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+# Синхронные хуки после каждого вызова инструмента, которые только задерживают агента (TASK-1004):
+# repowise-augment — ~0,4 с на вызов, по делу почти ничего, а repowise init ставит его заново.
+SLOW_TOOL_HOOKS = ("repowise-augment",)
+# Не просьбы пользователя: сообщения других вкладок, отчёты фоновых задач, автопродолжение.
+SERVICE_TAGS = ("task-notification", "cross-session-message", "teammate-message", "scheduled-task",
+                "system-reminder", "bash-notification")
+SERVICE_PREFIXES = ("Another Claude session sent a message", "Your claude.ai usage limit has reset")
+ACKS = {"продолжи", "продолжай", "дальше", "го", "ок", "окей", "угу", "ага", "ok", "okay", "continue", "go"}
+
+
+# ---------- где что лежит ----------
+
+def worktree_root(fallback_dir=None):
+    # Дерево, в котором открыта вкладка: его же видят строка внизу и хуки.
+    wid = os.environ.get("ORCA_WORKTREE_ID", "")
+    if "::" in wid and os.path.isdir(wid.split("::", 1)[1]):
+        return Path(wid.split("::", 1)[1])
+    start = fallback_dir or os.getcwd()
+    top = git(start, "rev-parse", "--show-toplevel")
+    return Path(top) if top else Path(start)
+
+
+def git(cwd, *args):
+    try:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                              timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+
+def pane_key():
+    return re.sub(r"[^\w.-]", "_", os.environ.get("ORCA_PANE_KEY", "") or "default")
+
+
+def state_file(root):
+    return root / ".artifacts" / "panes" / f"{pane_key()}.json"
+
+
+def load_state(root):
+    try:
+        return json.loads(state_file(root).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(root, st):
+    f = state_file(root)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+class locked:
+    # Табло и состояние пишут хуки и команды агента вперемешку — чтение-правка-запись под замком.
+    # Только на верхнем уровне (вложенный замок в том же процессе ждал бы сам себя); не дольше 3 с.
+    def __init__(self, root):
+        self.path = root / ".artifacts" / "board.lock"
+
+    def __enter__(self):
+        self.fd = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = open(self.path, "w")
+            for _ in range(60):
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.05)
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd:
+            self.fd.close()  # закрытие снимает замок
+
+
+def now_file(root):
+    # Что агент делает прямо сейчас — отдельный файл: его пишет фоновый хук без чтения-правки-записи.
+    return root / ".artifacts" / "panes" / f"{pane_key()}.now.json"
+
+
+def set_now(root, kind, text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return
+    f = now_file(root)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"kind": kind, "text": text[:300], "ts": time.time()}, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(f)
+
+
+def get_now(root):
+    try:
+        return json.loads(now_file(root).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def current_board(root, st=None):
+    st = st if st is not None else load_state(root)
+    b = st.get("board")
+    return Path(b) if b and Path(b).is_file() else None
+
+
+def main_root(root):
+    # Главная копия репозитория: рабочие деревья вкладок удаляются после go-final, а она остаётся.
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(common).parent if common and Path(common).name == ".git" else root
+
+
+def gallery_dir(root, board):
+    # Галерея вкладки — в главной копии репозитория (не в git): переживает удаление дерева. Галерея,
+    # заведённая до 14.10 внутри дерева, переезжает туда при первом обращении.
+    name = board.parent.name if board.name in BOARD_NAMES else board.stem
+    new, old = main_root(root) / ".artifacts" / "gallery" / name, root / ".artifacts" / "gallery" / name
+    if old != new and old.is_dir() and not new.exists():
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old), new)
+        except OSError:
+            return old
+    return new
+
+
+def shots_dir(board):
+    return board.parent / SHOTS if board.name in BOARD_NAMES else board.parent / f"{board.stem}-{SHOTS}"
+
+
+# ---------- табло: разбор и запись ----------
+
+def now_hm():
+    return datetime.now().strftime("%H:%M")
+
+
+def empty_board():
+    return {"title": "", "number": "", "started": "", "stage": "", "stage_time": "", "task": "",
+            "links": [], "next": "", "why": "", "intro": [], "sections": {}, "history": []}
+
+
+def board_number(board):
+    m = re.match(r"^(\d{3,})-", board.parent.name)
+    return m.group(1) if m else ""
+
+
+def link_target(board, target):
+    # В файле — относительный путь или адрес; в памяти — адрес или абсолютный путь.
+    target = target.strip().strip("<>")
+    if re.match(r"^[a-z]+://", target):
+        return target
+    return str((board.parent / target).resolve())
+
+
+def rel_md(board, path):
+    target = os.path.relpath(path, board.parent)
+    return f"<{target}>" if re.search(r"[\s()]", target) else target
+
+
+def link_md(board, label, target):
+    return f"[{label}]({target if re.match(r'^[a-z]+://', target) else rel_md(board, target)})"
+
+
+def link_uri(target):
+    return target if re.match(r"^[a-z]+://", target) else Path(target).as_uri()
+
+
+def parse_links(board, text):
+    return [[m.group(1), link_target(board, m.group(2))]
+            for m in re.finditer(r"\[([^\]]*)\]\((<[^>]+>|[^)]+)\)", text)]
+
+
+def split_sections(lines):
+    # Шапка — до первого «## »; разделы — по заголовкам.
+    head, sections, name = [], {}, None
+    for line in lines:
+        if line.startswith("## "):
+            name = SECTION_ALIASES.get(line[3:].strip(), line[3:].strip())
+            sections.setdefault(name, [])
+        elif name is None:
+            head.append(line)
+        else:
+            sections[name].append(line)
+    return head, sections
+
+
+def list_items(body):
+    out = []
+    for line in body:
+        if line.startswith("- "):
+            out.append(line[2:])
+        elif line.startswith("  ") and out:
+            out[-1] += " " + line.strip()
+    return out
+
+
+def blocks(body):
+    # Записи прежних разделов «Ваши комментарии» и «Кадры»: абзац от строки «**…» с картинками.
+    out = []
+    for line in body:
+        if line.startswith("**") or not out:
+            if line.strip():
+                out.append(line)
+        else:
+            out[-1] += "\n" + line
+    return [e.strip() for e in out if e.strip()]
+
+
+def item_time(item):
+    m = re.match(r"^\*\*((?:\d\d\.\d\d )?\d\d:\d\d)\*\*", item)
+    return m.group(1) if m else ""
+
+
+def time_key(b, t):
+    # «HH:MM» или «DD.MM HH:MM» → строка для сравнения; без даты — день начала сессии.
+    m = re.match(r"^(?:(\d\d)\.(\d\d) )?(\d\d):(\d\d)$", t or "")
+    if not m:
+        return ""
+    d = re.match(r"^(\d\d)\.(\d\d)", b["started"] or "")
+    day, month = (m.group(1), m.group(2)) if m.group(1) else (d.groups() if d else ("00", "00"))
+    return f"{month}{day}{m.group(3)}{m.group(4)}"
+
+
+def parse_history(body):
+    groups = []
+    for line in body:
+        m = re.match(r"^### (.+?) · (.+)$", line)
+        if m:
+            groups.append({"time": m.group(1).strip(), "title": m.group(2).strip(), "items": []})
+        elif line.startswith("- "):
+            if not groups:
+                groups.append({"time": "", "title": "", "items": []})
+            groups[-1]["items"].append(line[2:])
+        elif line.startswith("  ") and groups and groups[-1]["items"]:
+            groups[-1]["items"][-1] += " " + line.strip()
+    for g in groups:
+        if not g["time"] and g["items"]:
+            g["time"], g["title"] = item_time(g["items"][0]), g["title"] or "Начало"
+    return groups
+
+
+def place(b, item):
+    # Запись — в этап, к которому она относится по времени.
+    k = time_key(b, item_time(item))
+    target = None
+    for g in b["history"]:
+        if not k or time_key(b, g["time"]) <= k:
+            target = g
+    if target is None:
+        if not b["history"]:
+            b["history"].append({"time": item_time(item), "title": "Начало", "items": []})
+        target = b["history"][0]
+    target["items"].append(item)
+    target["items"].sort(key=lambda it: time_key(b, item_time(it)))
+
+
+def absorb_legacy(board, b, sections):
+    # Прежние разделы «Ваши комментарии» и «Кадры» (картинки в табло) — ссылками в «Ход сессии».
+    for e in blocks(sections.pop("Ваши комментарии", [])):
+        m = re.match(r"^\*\*(\S+)\*\* — (.*?)(?:\n|$)", e)
+        if not m:
+            continue
+        links = " · ".join(f"[📎 кадр]({p})" for p in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", e))
+        # та же просьба в «Ходе сессии» помечена «(кадр)» — с разницей до пары минут
+        k = time_key(b, m.group(1))
+        hit = next((it for g in b["history"] for it in g["items"] if " 🗣 " in it and it.endswith("(кадр)")
+                    and k and abs(int(time_key(b, item_time(it)) or 0) - int(k)) <= 2), None)
+        if hit:
+            for g in b["history"]:
+                g["items"] = [it[:-len(" (кадр)")] + f" — {links}" if it is hit else it for it in g["items"]]
+        else:
+            place(b, f"**{m.group(1)}** 🗣 {m.group(2)} — {links}")
+    for e in blocks(sections.pop("Кадры", [])):
+        m = re.match(r"^\*\*(\S+)\*\* ?(★|⚠)? ?(.*?)(?:\n|$)", e)
+        pics = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", e)
+        if m and pics:
+            hm = m.group(1) if re.match(r"\d\d:\d\d", m.group(1)) else now_hm()
+            icon = m.group(2) or ("★" if m.group(1) == "★" else "⚠" if m.group(1) == "⚠" else "★")
+            place(b, f"**{hm}** {icon} {m.group(3).strip()} — " + " · ".join(f"[кадр]({p})" for p in pics))
+
+
+def parse_old(board, lines, b):
+    # Табло первого вида (07.10, до 19:30): «Этап:», «Смотреть:», … строками без разметки.
+    head, sections = split_sections(lines)
+    why, in_why = [], False
+    for line in head:
+        if line.startswith("# "):
+            m = re.match(r"^# (\d+) · (.+)$", line)
+            b["number"], b["title"] = (m.group(1), m.group(2)) if m else ("", line[2:].strip())
+        elif line.startswith("Этап:"):
+            m = re.match(r"^Этап:\s*(.*?)\s*\((\d\d:\d\d)\)$", line)
+            b["stage"], b["stage_time"] = (m.group(1), m.group(2)) if m else (line[5:].strip(), "")
+        elif line.startswith("Смотреть:"):
+            v = line[9:].strip()
+            if v and v != "—":
+                url, _, hint = v.partition(" — ")
+                b["links"] = [[hint.strip() or url.strip(), link_target(board, url)]]
+        elif line.startswith("Дальше:"):
+            b["next"] = "" if line[7:].strip() == "—" else line[7:].strip()
+        elif line.startswith("Сейчас:"):
+            b["task"] = "" if line[7:].strip() == "—" else line[7:].strip()
+        elif line.startswith("Начато:"):
+            b["started"] = line[7:].strip()
+        elif line.startswith("Зачем:"):
+            why, in_why = [line[6:].strip()], True
+        elif in_why and line.strip():
+            why.append(line.strip())
+        else:
+            in_why = False
+    b["why"] = "" if why in ([], ["—"]) else " ".join(why)
+    history = []
+    for it in list_items(sections.pop("Ход сессии", [])):
+        m = re.match(r"^((?:\d\d\.\d\d )?\d\d:\d\d) (\S+) (.*)$", it)
+        if m and m.group(2) == "▶":
+            history.append({"time": m.group(1), "title": m.group(3), "items": []})
+        elif m and m.group(2) in ("↗", "◆"):
+            continue  # ссылка — в шапке, решение — в «Решениях»
+        else:
+            if not history:
+                history.append({"time": m.group(1) if m else "", "title": "Начало", "items": []})
+            history[-1]["items"].append(f"**{m.group(1)}** {m.group(2)} {m.group(3)}" if m else it)
+    b["history"] = [g for g in history if g["items"] or g is history[-1]]
+    for name in ("Ваши комментарии", "Кадры"):
+        if name in sections and name == "Кадры":
+            sections[name] = [re.sub(r"^- (★|⚠) (.+?) → (.+)$", r"**\1** \2\n\n![](\3)", l) for l in sections[name]]
+    absorb_legacy(board, b, sections)
+    for name, body in sections.items():
+        items = list_items(body)
+        if name == "Решения":
+            items = [re.sub(r"^\d\d:\d\d ", "", it) for it in items]
+        if items:
+            b["sections"][name] = items
+    return b
+
+
+def parse(board):
+    lines = board.read_text(encoding="utf-8").splitlines()
+    b = empty_board()
+    if any(l.startswith("Этап:") for l in lines[:12]):
+        b = parse_old(board, lines, b)
+    else:
+        head, sections = split_sections(lines)
+        why = None
+        for line in head:
+            m = re.match(r"^- \*\*(Сейчас|Задача|Смотреть|Дальше):\*\*\s*(.*)$", line)
+            if line.startswith("# "):
+                b["title"] = line[2:].strip()
+            elif re.match(r"^(Сессия \d+ · н|Н)ачата ", line):
+                b["started"] = line.split("ачата ", 1)[1].split(" · ", 1)[0].strip()
+            elif m:
+                key, val = m.groups()
+                if key == "Сейчас":
+                    t = re.match(r"^(.*?) · (\d\d:\d\d)$", val)
+                    b["stage"], b["stage_time"] = (t.group(1), t.group(2)) if t else (val, "")
+                elif key == "Задача":
+                    b["task"] = val
+                elif key == "Смотреть":
+                    b["links"] = parse_links(board, val)
+                else:
+                    b["next"] = val
+            elif line.startswith("**Зачем.**"):
+                why = [line[len("**Зачем.**"):].strip()]
+            elif why is not None and line.strip():
+                why.append(line.strip())
+            elif line.strip():
+                b["intro"].append(line)
+            elif why is not None:
+                b["why"], why = " ".join(why), None
+        if why is not None:
+            b["why"] = " ".join(why)
+        body = sections.pop("Ход сессии", [])
+        if any(l.startswith("### ") for l in body):
+            # в файле новые этапы сверху, в памяти — по времени: запись идёт в последний
+            b["history"] = sorted(reversed(parse_history(body)), key=lambda g: time_key(b, g["time"]))
+        else:  # табло без этапов (07.10, 19:30–20:10) — вся история одним этапом
+            items = list_items(body)
+            b["history"] = [{"time": item_time(items[0]), "title": "Начало", "items": items}] if items else []
+        absorb_legacy(board, b, sections)
+        for name, body in sections.items():
+            items = list_items(body) if name in SECTIONS else (["\n".join(body).strip()] if "\n".join(body).strip() else [])
+            if items:
+                b["sections"][name] = items
+    b["number"] = b["number"] or board_number(board)
+    return b
+
+
+def plural(n, one, few, many):
+    word = one if n % 10 == 1 and n % 100 != 11 else few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+    return f"{n} {word}"
+
+
+def history_text(b):
+    return "\n".join(it for g in b["history"] for it in g["items"])
+
+
+def render(board, b):
+    out = [f"# {b['title']}", ""]
+    line = f"Сессия {b['number']} · начата {b['started']}" if b["number"] else f"Начата {b['started']}"
+    text = history_text(b)
+    shots, commits = text.count("[📎 кадр"), text.count("● коммит")
+    line += (f" · 📎 {plural(shots, 'ваш кадр', 'ваших кадра', 'ваших кадров')}" if shots else "")
+    line += f" · ● {plural(commits, 'коммит', 'коммита', 'коммитов')}" if commits else ""
+    out += [line, ""]
+    stage = f"{b['stage']} · {b['stage_time']}" if b["stage_time"] else b["stage"]
+    out.append(f"- **Сейчас:** {stage or '—'}")
+    if b["task"]:
+        out.append(f"- **Задача:** {b['task']}")
+    if b["links"]:
+        out.append("- **Смотреть:** " + " · ".join(link_md(board, l, t) for l, t in b["links"]))
+    if b["next"]:
+        out.append(f"- **Дальше:** {b['next']}")
+    if b["why"]:
+        out += ["", f"**Зачем.** {b['why']}"]
+    if b["intro"]:
+        out += [""] + b["intro"]
+    names = [n for n in SECTIONS if n != "Ход сессии"] + [n for n in b["sections"] if n not in SECTIONS]
+    for name in names:
+        items = b["sections"].get(name) or []
+        if not items:
+            continue
+        out += ["", f"## {name}", ""]
+        out += [f"- {it}" for it in items] if name in SECTIONS else items
+    if b["history"]:
+        out += ["", "## Ход сессии"]
+        for g in reversed(b["history"]):  # новые этапы сверху, внутри этапа — по времени
+            out += ["", f"### {g['time']} · {g['title']}"]
+            if g["items"]:
+                out += [""] + [f"- {it}" for it in g["items"]]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def save(board, b):
+    board.write_text(render(board, b), encoding="utf-8")
+
+
+def stamp(b):
+    # Время в «Ходе сессии»; если сессия идёт не первый день — с датой.
+    today = datetime.now().strftime("%d.%m.%Y")
+    return now_hm() if not b["started"] or b["started"].startswith(today) else datetime.now().strftime("%d.%m %H:%M")
+
+
+def add(b, name, text):
+    b["sections"].setdefault(name, []).append(text)
+
+
+def new_stage(b, title):
+    # Новый этап — новый заголовок в «Ходе сессии»; пустой предыдущий просто переименовать.
+    if b["history"] and not b["history"][-1]["items"]:
+        b["history"][-1].update(time=stamp(b), title=title)
+    else:
+        b["history"].append({"time": stamp(b), "title": title, "items": []})
+
+
+def log(b, icon, text):
+    if not b["history"]:
+        new_stage(b, b["stage"] or "Начало")
+    b["history"][-1]["items"].append(f"**{stamp(b)}** {icon} {text}")
+
+
+def touch(root, ask=False, stage=False):
+    st = load_state(root)
+    st["last_update_ts"] = time.time()
+    if ask:
+        st["last_ask_ts"] = time.time()
+    if stage:
+        st["stage_ts"] = time.time()  # строка внизу: свежий этап важнее того, что агент делал до него
+    save_state(root, st)
+
+
+def require_board():
+    root = worktree_root()
+    board = current_board(root)
+    if not board:
+        sys.exit("Табло нет — сначала: artifacts init \"<тема>\"")
+    return root, board
+
+
+def task_title(root, task_id):
+    try:
+        out = subprocess.run(["backlog", "task", "view", task_id, "--plain"], cwd=root,
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    m = re.search(rf"^Task {re.escape(task_id)} - (.+)$", out, re.MULTILINE)
+    return f"{task_id} {m.group(1).strip()}" if m else task_id
+
+
+def task_or_text(root, args):
+    text = " ".join(args).strip()
+    return task_title(root, text) if re.fullmatch(r"TASK-\d+(\.\d+)*", text) else text
+
+
+# ---------- номер и папка сессии ----------
+
+def slug(title, limit=40):
+    words = re.sub(r"[^\w]+", " ", title, flags=re.UNICODE).split()
+    out = ""
+    for w in words:
+        if len(out) + len(w) + 1 > limit:
+            break
+        out = f"{out}-{w}" if out else w
+    out = out or "Сессия"
+    return out[0].upper() + out[1:]
+
+
+def next_session_number(root):
+    # Номер на все деревья проекта сразу: счётчик и замок — в общей папке git.
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    trees = [root]
+    lock = counter = None
+    if common:
+        lock, counter = Path(common) / "artifacts-session.lock", Path(common) / "artifacts-session-counter"
+        trees += [Path(l[9:]) for l in git(root, "worktree", "list", "--porcelain").splitlines()
+                  if l.startswith("worktree ")]
+        for _ in range(50):
+            try:
+                lock.mkdir()
+                break
+            except FileExistsError:
+                time.sleep(0.1)
+    try:
+        top = 0
+        for t in trees:
+            for d in (t / "sessions").glob("*"):
+                m = re.match(r"^(\d{3,})-", d.name)
+                if m:
+                    top = max(top, int(m.group(1)))
+        if counter and counter.exists():
+            top = max(top, int(counter.read_text().strip() or 0))
+        n = top + 1
+        if counter:
+            counter.write_text(str(n))
+        return n
+    finally:
+        if lock:
+            shutil.rmtree(lock, ignore_errors=True)
+
+
+def cmd_init(args):
+    title = " ".join(args).strip()
+    if not title:
+        sys.exit("Нужна тема: artifacts init \"<тема>\"")
+    root = worktree_root()
+    st = load_state(root)
+    old = current_board(root, st)
+    if old and parse(old)["title"] == title:
+        print(old)
+        return
+    now = datetime.now()
+    if (root / "sessions").is_dir():
+        n = next_session_number(root)
+        folder = root / "sessions" / f"{n:03d}-{now:%d%m%y}_{slug(title)}"
+        folder.mkdir(parents=True)
+        board = folder / BOARD_NAME
+    else:
+        (root / ".artifacts").mkdir(exist_ok=True)
+        board = root / ".artifacts" / f"{now:%y%m%d-%H%M}_{slug(title)}.md"
+    b = empty_board()
+    b.update(title=title, number=board_number(board), started=f"{now:%d.%m.%Y %H:%M}",
+             stage="Разбор", stage_time=f"{now:%H:%M}")
+    new_stage(b, "Разбор")
+    if old:
+        ob = parse(old)
+        log(ob, "→", f"продолжение — {board.relative_to(root)}")
+        flush_log(ob, st)
+        save(old, ob)
+    save(board, b)
+    st.update(board=str(board), last_update_ts=time.time(), stage_ts=time.time())
+    flush_pending(root, board, st)
+    save_state(root, st)
+    print(board)
+
+
+# ---------- кадры пользователя из чата ----------
+
+def iso_utc(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def local_hm(iso):
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    except Exception:
+        return now_hm()
+
+
+def user_images(st):
+    # Картинки, которые пользователь вставил в чат после последней записи: [(время ISO, [блоки])].
+    tp = st.get("transcript")
+    if not tp or not Path(tp).is_file():
+        return []
+    since = st.get("images_since") or iso_utc(st.get("last_prompt_ts", time.time()) - 120)
+    seen = set(st.get("images_seen", []))
+    out = []
+    with open(tp, encoding="utf-8") as f:
+        for line in f:
+            if '"image"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            ts, blocks = r.get("timestamp", ""), None
+            msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+            att = r.get("attachment") if isinstance(r.get("attachment"), dict) else {}
+            if r.get("type") == "user" and not r.get("isMeta") and isinstance(msg.get("content"), list):
+                blocks = msg["content"]
+                if any(isinstance(x, dict) and x.get("type") == "tool_result" for x in blocks):
+                    continue  # кадр, который снял и посмотрел агент, — не пользовательский
+            elif r.get("type") == "attachment" and att.get("type") == "queued_command":
+                blocks, ts = att.get("prompt"), att.get("timestamp", ts)  # сообщение посреди хода
+            if not isinstance(blocks, list) or ts <= since:
+                continue
+            imgs = [x for x in blocks if isinstance(x, dict) and x.get("type") == "image"
+                    and (x.get("source") or {}).get("type") == "base64"]
+            imgs = [x for x in imgs if hashlib.sha1(x["source"]["data"][:4000].encode()).hexdigest()[:12] not in seen]
+            if imgs:
+                out.append((ts, imgs))
+    return out
+
+
+IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+
+def user_shot(sd, hm, ext):
+    # Имя кадра пользователя в shots/: 1917-user-1.png, 1917-user-2.png…
+    sd.mkdir(parents=True, exist_ok=True)
+    k = 1
+    while (sd / f"{hm.replace(':', '')}-user-{k}{ext}").exists():
+        k += 1
+    return sd / f"{hm.replace(':', '')}-user-{k}{ext}"
+
+
+def save_user_images(root, board, st, found):
+    # Кадры пользователя — в shots/ рядом с табло и в галерею; возвращает имена файлов.
+    names = []
+    sd = shots_dir(board)
+    for ts, imgs in found:
+        for img in imgs:
+            src = img["source"]
+            f = user_shot(sd, local_hm(ts), IMAGE_EXT.get(src.get("media_type"), ".png"))
+            f.write_bytes(base64.b64decode(src["data"]))
+            names.append(f)
+            st.setdefault("images_seen", []).append(hashlib.sha1(src["data"][:4000].encode()).hexdigest()[:12])
+        st["images_since"] = max(st.get("images_since", ""), ts)
+    st["images_seen"] = st.get("images_seen", [])[-50:]
+    return names
+
+
+# ---------- просьбы и кадры пользователя: пишет хук, без агента ----------
+
+def prompt_kind(prompt):
+    # Хук «сообщение пользователя» срабатывает и на сообщения других вкладок, отчёты фоновых задач и
+    # автопродолжение после лимита — это не просьбы пользователя.
+    p = (prompt or "").lstrip()
+    m = re.match(r"<([\w-]+)", p)
+    if (m and m.group(1) in SERVICE_TAGS) or p.startswith(SERVICE_PREFIXES):
+        return "service"
+    return "human"
+
+
+def prompt_quote(prompt, limit=QUOTE_LEN):
+    # Начало текста пользователя одной строкой: без меток вставок и картинок, по границе слова.
+    t = re.sub(r"</?pasted_content[^>]*>", " ", prompt or "")
+    t = re.sub(r"\[(?:Image|Pasted text) #\d+[^\]]*\]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > limit:
+        t = t[:limit].rsplit(" ", 1)[0].rstrip(",.;:—- ") + "…"
+    return t
+
+
+def cc_images_dir(data):
+    # Claude Code сам кладёт каждую вставленную картинку в <tmp>/claude-<uid>/<проект>/<сессия>/images/<N>.*
+    # (N — номер «[Image #N]» в тексте сообщения); папка — соседка scratchpad_dir.
+    if data.get("scratchpad_dir"):
+        return Path(data["scratchpad_dir"]).parent / "images"
+    tp, sid = data.get("transcript_path"), data.get("session_id")
+    if not tp or not sid:
+        return None
+    project, uid = Path(tp).parent.name, os.getuid()
+    own = os.environ.get("CLAUDE_CODE_TMPDIR", "")
+    for base in (own, own and os.path.join(own, f"claude-{uid}"), f"/private/tmp/claude-{uid}",
+                 f"/tmp/claude-{uid}", os.path.join(os.environ.get("TMPDIR", "/tmp"), f"claude-{uid}")):
+        if base and (Path(base) / project / sid).is_dir():
+            return Path(base) / project / sid / "images"
+    return None
+
+
+def cc_image(images, n, since=0):
+    # Файл вставки №N. Рядом бывает и уменьшенная копия для модели (1.png и 1.jpg) — берём крупнее;
+    # номер, встречавшийся раньше, отсекает since.
+    if not images or not images.is_dir():
+        return None
+    files = [f for f in images.glob(f"{n}.*") if f.is_file()]
+    fresh = [f for f in files if f.stat().st_mtime >= since - 5] or files
+    return max(fresh, key=lambda f: f.stat().st_size) if fresh else None
+
+
+def user_item(board, hm, quote, files):
+    links = " · ".join(f"[📎 кадр]({rel_md(board, f)})" for f in files)
+    return f"**{hm}** 🗣 " + (f"{quote} — {links}" if quote and links else quote or links)
+
+
+def pending_dir(root):
+    return root / ".artifacts" / "pending" / pane_key()
+
+
+def record_prompt(root, board, st, data):
+    # Просьба пользователя — началом его текста в «Ход сессии», вставленные кадры — в shots/ и галерею.
+    # Табло ещё нет — копится в состоянии вкладки и переносится при init.
+    prompt = data.get("prompt") or ""
+    quote = prompt_quote(prompt)
+    nums = list(dict.fromkeys(re.findall(r"\[Image #(\d+)\]", prompt)))
+    pid = data.get("prompt_id") or ""
+    if (not nums and re.sub(r"[^\w ]", "", quote.lower()).strip() in ACKS | {""}) \
+            or (pid and pid in st.get("recorded", [])):
+        return
+    images = cc_images_dir(data)
+    since = st.get("last_human_ts", 0) if st.get("session_id") == data.get("session_id") else 0
+    found, missing = [], []
+    for n in nums:
+        f = cc_image(images, n, since)
+        (found if f else missing).append(f or n)
+    if board:
+        b = parse(board)
+        hm = stamp(b)
+        copies = []
+        for f in found:
+            dst = user_shot(shots_dir(board), hm, f.suffix.lower())
+            shutil.copy2(f, dst)
+            copies.append(dst)
+        place(b, user_item(board, hm, quote, copies))
+        flush_log(b, st)
+        save(board, b)
+        for f in copies:
+            add_frame(root, board, f, quote or "кадр пользователя", "user", when=hm)
+    else:
+        hm = now_hm()
+        copies = []
+        for f in found:
+            dst = user_shot(pending_dir(root), hm, f.suffix.lower())
+            shutil.copy2(f, dst)
+            copies.append(str(dst))
+        st.setdefault("pending", []).append({"hm": hm, "quote": quote, "files": copies})
+    if missing:
+        st.setdefault("missing", []).append({"pid": pid, "nums": missing, "hm": hm, "quote": quote,
+                                             "ts": time.time(), "session": data.get("session_id")})
+    st["recorded"] = (st.get("recorded", []) + [pid])[-50:]
+    st["images_since"] = iso_utc(time.time())  # ask больше не достаёт эти кадры из истории чата
+
+
+def flush_pending(root, board, st):
+    # Просьбы и кадры, пришедшие до init, — на новое табло, в их время.
+    pend = st.pop("pending", [])
+    if not pend:
+        return
+    b = parse(board)
+    frames = []
+    for p in pend:
+        files = []
+        for src in map(Path, p.get("files", [])):
+            if src.is_file():
+                dst = user_shot(shots_dir(board), p["hm"], src.suffix.lower())
+                shutil.move(str(src), dst)
+                files.append(dst)
+                frames.append((dst, p["quote"], p["hm"]))
+        place(b, user_item(board, p["hm"], p["quote"], files))
+    save(board, b)
+    for f, quote, hm in frames:
+        add_frame(root, board, f, quote or "кадр пользователя", "user", when=hm)
+
+
+def transcript_images(tp, nums, since_ts):
+    # Запасной путь для кадров, которых нет в images/: по транскрипту. Номера вставок (imagePasteIds)
+    # идут в том же порядке, что пути «[Image: source: …]» и картинки сообщения.
+    out = {}
+    if not tp or not Path(tp).is_file():
+        return out
+    since, wanted = iso_utc(since_ts - 300), {str(n) for n in nums}
+    ids_by_pid, paths_by_pid = {}, {}
+    with open(tp, encoding="utf-8") as fh:
+        for line in fh:
+            if "imagePasteIds" not in line and "[Image: source:" not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            att = r.get("attachment") if isinstance(r.get("attachment"), dict) else {}
+            if (att.get("timestamp") or r.get("timestamp", "")) < since:
+                continue
+            msg = r.get("message") if isinstance(r.get("message"), dict) else {}
+            content = att.get("prompt") if att.get("type") == "queued_command" else msg.get("content")
+            ids = [str(i) for i in (att.get("imagePasteIds") or r.get("imagePasteIds") or [])]
+            if r.get("isMeta") and isinstance(content, list):
+                paths_by_pid[r.get("promptId")] = [p for x in content if isinstance(x, dict) for p in
+                                                   re.findall(r"\[Image: source: ([^\]]+)\]", x.get("text", ""))]
+                continue
+            if not ids or not isinstance(content, list):
+                continue
+            ids_by_pid[r.get("promptId")] = ids
+            imgs = [x for x in content if isinstance(x, dict) and x.get("type") == "image"
+                    and (x.get("source") or {}).get("type") == "base64"]
+            if len(imgs) == len(ids):
+                for n, img in zip(ids, imgs):
+                    if n in wanted:
+                        out[n] = ("b64", img["source"])
+    for pid, ids in ids_by_pid.items():
+        paths = paths_by_pid.get(pid, [])
+        if pid and len(paths) == len(ids):
+            for n, p in zip(ids, paths):
+                if n in wanted and Path(p).is_file():
+                    out[n] = ("file", p)  # оригинал лучше уменьшенной копии из сообщения
+    return out
+
+
+def recover_missing(root, board, st, data):
+    # В конце хода: кадры, которых не было в images/ в момент сообщения, — ещё раз из images/, потом из
+    # транскрипта; находка дописывается к той же строке «Хода сессии».
+    left = []
+    for m in st.pop("missing", []):
+        if time.time() - m["ts"] > 3600 or not board:
+            continue
+        images = cc_images_dir(data) if m.get("session") == data.get("session_id") else None
+        got = {str(n): ("file", str(f)) for n in m["nums"] if (f := cc_image(images, n, m["ts"] - 60))}
+        rest = [n for n in m["nums"] if str(n) not in got]
+        if rest:
+            got.update(transcript_images(data.get("transcript_path"), rest, m["ts"]))
+        files = []
+        for n in m["nums"]:
+            kind, src = got.get(str(n), (None, None))
+            if kind == "file":
+                dst = user_shot(shots_dir(board), m["hm"], Path(src).suffix.lower())
+                shutil.copy2(src, dst)
+                files.append(dst)
+            elif kind == "b64":
+                dst = user_shot(shots_dir(board), m["hm"], IMAGE_EXT.get(src.get("media_type"), ".png"))
+                dst.write_bytes(base64.b64decode(src["data"]))
+                files.append(dst)
+        rest = [n for n in m["nums"] if str(n) not in got]
+        if rest:
+            left.append({**m, "nums": rest})
+        if not files:
+            continue
+        b = parse(board)
+        head = f"**{m['hm']}** 🗣 {m['quote']}"
+        links = " · ".join(f"[📎 кадр]({rel_md(board, f)})" for f in files)
+        hit = False
+        for g in b["history"]:
+            for i, it in enumerate(g["items"]):
+                if not hit and it.startswith(head):
+                    g["items"][i] = it + (" · " if "[📎 кадр" in it else (" — " if m["quote"] else "")) + links
+                    hit = True
+        if not hit:
+            place(b, user_item(board, m["hm"], m["quote"], files))
+        save(board, b)
+        for f in files:
+            add_frame(root, board, f, m["quote"] or "кадр пользователя", "user", when=m["hm"])
+    if left:
+        st["missing"] = left
+
+
+def tail_lines(path, size=1 << 20):
+    # Последние строки большого файла (транскрипты бывают по сотне мегабайт).
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            end = fh.tell()
+            fh.seek(max(end - size, 0))
+            data = fh.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    return lines[1:] if end > size else lines
+
+
+def recaps(tp, after=""):
+    # Сводки Claude Code (session recap): ≥3 мин после хода, вкладка не в фокусе — «где мы и чего ждём».
+    out = []
+    for line in tail_lines(tp) if tp else []:
+        if '"away_summary"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("subtype") == "away_summary" and r.get("timestamp", "") > after:
+            text = re.sub(r"\s*\(disable recaps in /config\)\s*$", "", r.get("content", "")).strip()
+            if text:
+                out.append((r["timestamp"], text))
+    return out
+
+
+def log_recaps(board, st, tp):
+    found = recaps(tp, st.get("recap_seen", ""))
+    if not found:
+        return
+    b = parse(board)
+    for ts, text in found:
+        text = re.sub(r"\s+", " ", text)  # вне f-строки: обратная косая в ней — только с Python 3.12
+        place(b, f"**{local_hm(ts)}** ⟳ {text}")
+    save(board, b)
+    st["recap_seen"] = found[-1][0]
+
+
+def first_sentence(text, limit=160):
+    # Начало финального ответа хода — для строки внизу; заголовки и таблицы пропускаются.
+    for line in (text or "").splitlines():
+        if re.match(r"^\s*(#|\|)", line):
+            continue
+        line = re.sub(r"[*_`#>|]+", "", line).strip(" -•")
+        if line:
+            m = re.match(rf"^(.{{20,{limit}}}?[.!?…])(\s|$)", line)
+            return m.group(1) if m else cut(line, limit)
+    return ""
+
+
+# ---------- команды ----------
+
+def cmd_simple(cmd, args):
+    root, board = require_board()
+    b = parse(board)
+    text = " ".join(args).strip()
+    if cmd == "ask":
+        files = []
+        while "--shot" in args:
+            i = args.index("--shot")
+            files.append(Path(args[i + 1]).expanduser())
+            del args[i:i + 2]
+        text = " ".join(args).strip()
+        st = load_state(root)
+        found = user_images(st)
+        saved = save_user_images(root, board, st, found)
+        save_state(root, st)
+        sd = shots_dir(board)
+        for f in files:
+            if f.is_file() and sd not in f.resolve().parents:
+                sd.mkdir(exist_ok=True)
+                dst = sd / f"{datetime.now():%H%M}-user-{slug(text, 30)}{f.suffix.lower()}"
+                shutil.copy2(f, dst)
+                saved.append(dst)
+            elif f.is_file():
+                saved.append(f.resolve())
+        when = local_hm(found[0][0]) if found else stamp(b)
+        if saved:
+            links = " · ".join(f"[📎 кадр]({rel_md(board, f)})" for f in saved)
+            place(b, f"**{when}** 🗣 {text} — {links}")
+        else:
+            log(b, "🗣", text)
+        save(board, b)
+        for f in saved:
+            add_frame(root, board, f, text, "user", when=when)
+        touch(root, ask=True)
+        return
+    if cmd == "stage":
+        b["stage"], b["stage_time"] = text, now_hm()
+        new_stage(b, text)
+    elif cmd == "next":
+        b["next"] = text
+    elif cmd == "why":
+        b["why"] = text
+    elif cmd == "link":
+        if args[0] == "--clear":
+            b["links"] = []
+        elif args[0] == "--drop":
+            k = int(args[1]) - 1
+            if 0 <= k < len(b["links"]):
+                b["links"].pop(k)
+        else:
+            target = args[0] if re.match(r"^[a-z]+://", args[0]) else str(Path(args[0]).expanduser().resolve())
+            label = " ".join(args[1:]).strip() or (re.sub(r"^https?://", "", target) if "://" in target
+                                                   else Path(target).name)
+            b["links"] = [[label, target]] + [l for l in b["links"] if l[1] != target]
+            b["links"] = b["links"][:MAX_LINKS]
+    elif cmd == "now":
+        b["task"] = task_or_text(root, args)
+    elif cmd == "queue":
+        q = b["sections"].setdefault("Очередь", [])
+        if args and args[0] == "--done":
+            k = int(args[1]) - 1
+            if not 0 <= k < len(q):
+                sys.exit(f"В очереди {len(q)} пунктов")
+            log(b, "✓", f"из очереди: {q.pop(k)}")
+        else:
+            q.append(task_or_text(root, args))
+    elif cmd == "problem":
+        frame = args[1] if len(args) > 1 and Path(args[1]).is_file() else None
+        text = args[0] if frame else text
+        add(b, "Находки", f"⚠ {now_hm()} {text}")
+        shot = add_frame(root, board, frame, text, "problem") if frame else None
+        log(b, "⚠", text + (f" — [кадр]({rel_md(board, shot)})" if shot else ""))
+    elif cmd == "fixed":
+        items = b["sections"].get("Находки", [])
+        k = int(text) - 1
+        if not 0 <= k < len(items):
+            sys.exit(f"Находок {len(items)}")
+        items[k] = items[k].replace("⚠", "✓", 1)
+        log(b, "✓", "исправлено: " + items[k][2:].split(" ", 1)[-1])
+    elif cmd == "decision":
+        add(b, "Решения", text)
+    elif cmd == "done":
+        add(b, "Итог", text)
+    st = load_state(root)
+    flush_log(b, st)
+    save(board, b)
+    save_state(root, st)
+    touch(root, stage=cmd == "stage")
+    if cmd == "stage":
+        refresh_gallery(root, board)
+
+
+# ---------- кадры ----------
+
+def file_hash(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def frame_caption(path):
+    # Подпись по имени файла: без времени в начале, дефисы и подчёркивания — пробелы.
+    stem = re.sub(r"^\d{1,2}[-_.:]?\d\d(?:[-_.:]?\d\d)?(?=[-_ ]|$)[-_ ]*", "", Path(path).stem)
+    return re.sub(r"[-_]+", " ", stem).strip() or Path(path).stem
+
+
+def add_frame(root, board, src, caption, kind="work", when=None, note=""):
+    # Кадр — в галерею, один раз по содержимому; находка и главный — ещё и в shots/ папки сессии (в git).
+    # Возвращает путь в shots/.
+    src = Path(src)
+    gdir = gallery_dir(root, board)
+    gdir.mkdir(parents=True, exist_ok=True)
+    index_file = gdir / "index.json"
+    index = json.loads(index_file.read_text(encoding="utf-8")) if index_file.exists() else []
+    digest = file_hash(src)
+    for f in index:  # кадры до 14.10 — без отпечатка содержимого
+        if "hash" not in f and (gdir / f["file"]).is_file():
+            f["hash"] = file_hash(gdir / f["file"])
+    same = next((f for f in index if f.get("hash") == digest), None)
+    if same and not (kind in ("key", "problem", "user") and same["kind"] not in ("key", "problem", "user")):
+        return None
+    if same:  # кадр уже в галерее, а теперь он находка, главный или кадр пользователя
+        same.update(kind=kind, caption=caption if kind == "user" else same["caption"])
+        name = same["file"]
+    else:
+        base = f"{datetime.now():%H-%M-%S}_{slug(caption, 50)}"
+        name, k = f"{base}{src.suffix.lower()}", 2
+        while (gdir / name).exists():
+            name, k = f"{base}-{k}{src.suffix.lower()}", k + 1
+        shutil.copy2(src, gdir / name)
+        index.append({"file": name, "caption": caption, "time": when or now_hm(), "date": f"{datetime.now():%d.%m}",
+                      "kind": kind, "hash": digest, "src": str(src.resolve()), **({"note": note} if note else {})})
+    index_file.write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+    shot = None
+    if kind in ("key", "problem"):
+        sd = shots_dir(board)
+        sd.mkdir(exist_ok=True)
+        shot = sd / name
+        shutil.copy2(src, shot)
+    render_gallery(gdir, parse(board), index)
+    return shot
+
+
+def refresh_gallery(root, board):
+    gdir = gallery_dir(root, board)
+    if (gdir / "index.json").exists():
+        render_gallery(gdir, parse(board), json.loads((gdir / "index.json").read_text(encoding="utf-8")))
+
+
+def frame_order(b, f):
+    # Порядок кадра по времени; у кадров прошлых дней сессии — с датой.
+    t = f["time"] if not f.get("date") or f["date"] == b["started"][:5] else f"{f['date']} {f['time']}"
+    return time_key(b, t) or "0"
+
+
+def render_gallery(gdir, b, index):
+    # Все кадры по времени одним списком «картинка — текст», новые сверху; этапы — тонкими заголовками.
+    # Клик — кадр во весь экран с масштабом и листанием.
+    frames = [f for _, f in sorted(enumerate(index), key=lambda x: (frame_order(b, x[1]), x[0]), reverse=True)]
+    stages = sorted(b["history"], key=lambda g: time_key(b, g["time"]))
+    rows, data, shown = [], [], None
+    for i, f in enumerate(frames):
+        k = frame_order(b, f)
+        stage = None
+        for g in stages:
+            if time_key(b, g["time"]) <= k:
+                stage = g
+        if stage is not None and stage is not shown:
+            rows.append(f'<h2><span>{html.escape(stage["time"])}</span>{html.escape(stage["title"])}</h2>')
+            shown = stage
+        user, problem = f["kind"] == "user", f["kind"] == "problem"
+        mark = "📎 ваш кадр" if user else "⚠ находка" if problem else ""
+        day = f" {f['date']}" if f.get("date") and f["date"] != b["started"][:5] else ""
+        cap = f.get("caption") or ""
+        note = f.get("note") or ""
+        data.append({"src": f["file"], "cap": f"{f['time']}{day} · {cap}" + (f" — {note}" if note else "")})
+        src = html.escape(f["file"])
+        lazy = ' loading="lazy"' if i >= 30 else ""  # свежие — сразу, остальные — по мере прокрутки
+        rows.append(f'<div class="row {f["kind"]}"><a class="pic" href="{src}" data-i="{i}"><img src="{src}"{lazy}></a>'
+                    f'<div class="tx"><div class="tm">{f["time"]}{day}{" · " + mark if mark else ""}</div>'
+                    f'<div class="cap">{html.escape(cap)}</div>'
+                    + (f'<div class="note">{html.escape(note)}</div>' if note else "") + "</div></div>")
+    yours = sum(1 for f in index if f["kind"] == "user")
+    count = plural(len(index), "кадр", "кадра", "кадров") + (f" · 📎 {yours} ваших" if yours else "")
+    page = GALLERY_HTML
+    for k, v in {"@@TITLE@@": html.escape(f"Кадры · сессия {b['number']}: {b['title']}" if b["number"]
+                                          else f"Кадры · {b['title']}"),
+                 "@@COUNT@@": count, "@@ROWS@@": "".join(rows) or '<p class="empty">Кадров пока нет</p>',
+                 "@@FRAMES@@": json.dumps(data, ensure_ascii=False)}.items():
+        page = page.replace(k, v)
+    (gdir / "index.html").write_text(page, encoding="utf-8")
+    (gdir / "yours.html").unlink(missing_ok=True)  # отдельная страница ваших кадров (07.10) — теперь общий список
+
+
+GALLERY_HTML = """<!doctype html><meta charset="utf-8"><title>@@TITLE@@</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font:14px/1.45 -apple-system,system-ui,sans-serif;margin:0;background:#fafafa;color:#222}
+@media(prefers-color-scheme:dark){body{background:#1b1b1d;color:#ddd}.bar{background:#1b1b1d!important}.row{border-color:#fff1!important}}
+.bar{position:sticky;top:0;z-index:5;background:#fafafa;padding:12px 24px;border-bottom:1px solid #8883;
+display:flex;gap:16px;align-items:baseline}
+h1{font-size:16px;margin:0;font-weight:600}.bar .n{opacity:.6}
+main{padding:4px 24px 48px;max-width:1280px}
+h2{font-size:13px;font-weight:600;margin:26px 0 4px;padding-bottom:6px;border-bottom:1px solid #8883;opacity:.75}
+h2 span{font-variant-numeric:tabular-nums;font-weight:500;margin-right:10px;opacity:.7}
+.row{display:flex;gap:20px;align-items:flex-start;padding:14px 0;border-bottom:1px solid #0000000d}
+.pic{flex:0 0 min(560px,55%);cursor:zoom-in;display:block}
+.pic img{width:100%;max-height:420px;object-fit:contain;object-position:left top;display:block;border-radius:6px;background:#8881}
+.tx{flex:1;min-width:0}.tm{font-variant-numeric:tabular-nums;opacity:.55;font-size:12px;margin-bottom:2px}
+.cap{font-weight:600;word-break:break-word}.note{opacity:.75;margin-top:4px;word-break:break-word}
+.row.user .pic img{box-shadow:0 0 0 2px #2f6fde}.row.user .cap{font-weight:500}
+.row.problem .pic img{box-shadow:0 0 0 2px #e5484d}.empty{opacity:.6;padding:20px 0}
+@media(max-width:700px){.row{flex-direction:column;gap:8px}.pic{flex:none;width:100%}main{padding:4px 12px 40px}}
+#lb{position:fixed;inset:0;background:#000e;display:none;z-index:10;overflow:hidden;user-select:none}
+#lb.on{display:block}#lb img{position:absolute;left:0;top:0;transform-origin:0 0;max-width:none;cursor:grab}
+#lb img.drag{cursor:grabbing}
+#cb{position:absolute;left:0;right:0;bottom:0;padding:10px 16px;color:#eee;background:#000a;
+display:flex;gap:16px;align-items:center;font-size:13px}#cb b{font-weight:600}#cb .sp{flex:1}
+#cb a{color:#9cf}.nav,#x{position:absolute;width:52px;height:52px;border-radius:50%;background:#000a;color:#fffc;
+display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 0 0 1px #fff3}
+.nav{top:50%;transform:translateY(-50%);font-size:34px;padding-bottom:4px}.nav:hover,#x:hover{background:#000d;color:#fff}
+#prev{left:14px}#next{right:14px}#x{top:14px;right:14px;font-size:22px}
+</style>
+<div class="bar"><h1>@@TITLE@@</h1><span class="n">@@COUNT@@</span></div>
+<main>@@ROWS@@</main>
+<div id="lb"><img id="im"><span id="x" title="Закрыть (Esc)">✕</span>
+<span class="nav" id="prev" title="Назад (←)">‹</span><span class="nav" id="next" title="Дальше (→)">›</span>
+<div id="cb"><b id="cap"></b><span class="sp"></span><span id="pos"></span><span id="zoom"></span>
+<a id="orig" target="_blank">оригинал</a></div></div>
+<script>
+const F=@@FRAMES@@,lb=document.getElementById('lb'),im=document.getElementById('im');
+let i=0,s=1,x=0,y=0,fit=1,drag=null;
+function apply(){im.style.transform=`translate(${x}px,${y}px) scale(${s})`;
+ document.getElementById('zoom').textContent=Math.round(s*100)+'%'}
+function fitImg(){const W=innerWidth,H=innerHeight-44,w=im.naturalWidth,h=im.naturalHeight;
+ fit=Math.min(W/w,H/h,1);s=fit;x=(W-w*s)/2;y=(H-h*s)/2;apply()}
+function show(k){i=(k+F.length)%F.length;im.onload=fitImg;im.src=F[i].src;
+ document.getElementById('cap').textContent=F[i].cap;document.getElementById('orig').href=F[i].src;
+ document.getElementById('pos').textContent=(i+1)+' / '+F.length;lb.classList.add('on')}
+function zoomAt(f,cx,cy){const n=Math.min(Math.max(s*f,fit*0.5),8);x=cx-(cx-x)*n/s;y=cy-(cy-y)*n/s;s=n;apply()}
+function hide(){lb.classList.remove('on')}
+document.querySelectorAll('.pic').forEach(c=>c.onclick=e=>{e.preventDefault();show(+c.dataset.i)});
+lb.addEventListener('wheel',e=>{e.preventDefault();zoomAt(Math.exp(-e.deltaY*(e.ctrlKey?0.01:0.002)),e.clientX,e.clientY)},{passive:false});
+im.ondblclick=e=>{if(Math.abs(s-1)<0.01&&fit<1)fitImg();else zoomAt(1/s,e.clientX,e.clientY)};
+im.onmousedown=e=>{e.preventDefault();drag=[e.clientX-x,e.clientY-y];im.classList.add('drag')};
+onmousemove=e=>{if(drag){x=e.clientX-drag[0];y=e.clientY-drag[1];apply()}};
+onmouseup=()=>{drag=null;im.classList.remove('drag')};
+lb.onclick=e=>{if(e.target===lb)hide()};
+document.getElementById('x').onclick=hide;
+document.getElementById('prev').onclick=()=>show(i-1);document.getElementById('next').onclick=()=>show(i+1);
+onkeydown=e=>{if(!lb.classList.contains('on'))return;
+ if(e.key==='Escape')hide();else if(e.key==='ArrowLeft')show(i-1);else if(e.key==='ArrowRight')show(i+1);
+ else if(e.key==='+'||e.key==='=')zoomAt(1.25,innerWidth/2,innerHeight/2);
+ else if(e.key==='-')zoomAt(0.8,innerWidth/2,innerHeight/2);else if(e.key==='0')fitImg()};
+onresize=()=>{if(lb.classList.contains('on'))fitImg()};
+// Новые кадры сверху; прокрутка переживает автообновление.
+const st=JSON.parse(sessionStorage.getItem('gal')||'null');
+if(st)addEventListener('load',()=>scrollTo(0,st.y));
+setInterval(()=>{if(!lb.classList.contains('on')&&!document.hidden){
+ sessionStorage.setItem('gal',JSON.stringify({y:scrollY}));location.reload()}},15000);
+</script>
+"""
+
+
+def cmd_shot(args):
+    root, board = require_board()
+    key = "--key" in args
+    args = [a for a in args if a != "--key"]
+    if not args or not Path(args[0]).is_file():
+        sys.exit("Нужен файл кадра: artifacts shot <кадр> \"<подпись>\" [--key]")
+    caption = " ".join(args[1:]).strip() or Path(args[0]).stem
+    shot = add_frame(root, board, args[0], caption, "key" if key else "work")
+    if shot:
+        b = parse(board)
+        log(b, "★", f"{caption} — [кадр]({rel_md(board, shot)})")
+        save(board, b)
+    touch(root)
+
+
+def frame_count(gdir):
+    try:
+        return len(json.loads((gdir / "index.json").read_text(encoding="utf-8")))
+    except Exception:
+        return 0
+
+
+def link_alive(target):
+    # Ссылка в строке — только живая: файл есть, стенд на этой машине отвечает. Чужие адреса не проверяем.
+    if not re.match(r"^[a-z]+://", target):
+        return Path(target).exists()
+    m = re.match(r"^https?://([^/:?#]+)(?::(\d+))?", target)
+    if not m or not (m.group(1) in ("localhost", "127.0.0.1", "0.0.0.0") or m.group(1).endswith(".localhost")):
+        return True
+    port = int(m.group(2) or (443 if target.startswith("https") else 80))
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+            return True
+    except OSError:
+        return False
+
+
+# ---------- строка внизу вкладки ----------
+
+def osc_link(url, text):
+    # OSC 8: кликабельный текст в терминале (Cmd+клик)
+    return f"\033]8;;{url}\a{text}\033]8;;\a"
+
+
+def cut(text, width):
+    return text if len(text) <= width else text[: max(width - 1, 1)] + "…"
+
+
+def term_width():
+    cols = os.environ.get("COLUMNS", "")
+    if not cols.isdigit():
+        try:
+            cols = subprocess.run("stty size </dev/tty", shell=True, capture_output=True, text=True,
+                                  timeout=1).stdout.split()[1]
+        except Exception:
+            cols = "100"
+    return max(int(cols) - 4, 30)
+
+
+def cmd_statusline():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    ws = data.get("workspace") or {}
+    root = worktree_root(ws.get("project_dir") or ws.get("current_dir") or data.get("cwd"))
+    st = load_state(root)
+    board = current_board(root, st)
+    if not board:
+        return
+    b = parse(board)
+    w = term_width()
+    bold, dim, reset = "\033[1m", "\033[2m", "\033[0m"
+    sep = f"{dim} · {reset}"
+
+    # «Сейчас»: этап, который назвал агент, а за ним — что идёт на самом деле, без агента: команда,
+    # которую он выполняет, итог хода, сводка Claude Code после простоя. Свежий этап важнее.
+    stage = b["stage"] + (f" · {b['stage_time']}" if b["stage_time"] else "")
+    what = b["task"] or (f"сессия {b['number']}: {b['title']}" if b["number"] else b["title"])
+    live = get_now(root)
+    recap = (recaps(data.get("transcript_path")) or [None])[-1]
+    if recap:
+        ts = datetime.fromisoformat(recap[0].replace("Z", "+00:00")).timestamp()
+        if ts > live.get("ts", 0):
+            live = {"kind": "recap", "text": recap[1], "ts": ts}
+    if live.get("ts", 0) > st.get("stage_ts", 0) and time.time() - live.get("ts", 0) < 12 * 3600:
+        kind, text = live.get("kind"), live["text"]
+        if kind == "tool" and not re.search(r"[а-яё]", text, re.IGNORECASE):
+            text = "работает"  # описание команды по-английски пользователю ничего не скажет
+        elif kind in ("turn", "recap"):
+            text = f"ждёт ответа · {text}"
+        icon = {"turn": "✓", "recap": "⟳"}.get(kind, "⋯")
+        what = f"{icon} {datetime.fromtimestamp(live['ts']):%H:%M} {text}"
+    first = cut(stage or "—", w - 2)
+    rest = w - 2 - len(first) - 3
+    print(f"▶ {bold}{first}{reset}" + (f"{sep}{cut(what, rest)}" if rest > 8 and what else ""))
+
+    links = [l for l in b["links"] if link_alive(l[1])]
+    if links:
+        shown, used = [], 2
+        for label, target in links:
+            label = cut(label, max(w - used - 3, 12))
+            if shown and used + len(label) + 3 > w:
+                break
+            shown.append(osc_link(link_uri(target), label))
+            used += len(label) + 3
+        print("👁 " + sep.join(shown))
+
+    if b["next"]:
+        print(cut(f"→ Дальше: {b['next']}", w))
+
+    parts = []
+    gdir = gallery_dir(root, board)
+    n = frame_count(gdir)
+    if n:
+        parts.append(osc_link((gdir / "index.html").as_uri(), f"🖼 Кадры {n}"))
+    problems = sum(1 for it in b["sections"].get("Находки", []) if it.startswith("⚠"))
+    if problems:
+        parts.append(f"⚠ {problems}")
+    queue = len(b["sections"].get("Очередь", []))
+    if queue:
+        parts.append(f"Очередь {queue}")
+    if parts:
+        print(sep.join(parts))
+
+
+# ---------- хуки Claude Code ----------
+
+def hook_output(event, context):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
+                     ensure_ascii=False))
+
+
+def rel(root, board):
+    try:
+        return str(board.relative_to(root))
+    except ValueError:
+        return str(board)
+
+
+def skill_brief():
+    # Раздел «Коротко» из SKILL.md — агент получает его в начале каждой сессии.
+    try:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        return text.split("## Коротко", 1)[1].split("\n## ", 1)[0].strip()
+    except Exception:
+        return ""
+
+
+def handoff_text(root, board, b):
+    # После сжатия контекста — верх табло вместо одной строки: агент продолжает работу по нему, как
+    # по handoff, без единого шага. Только то, что пересказ сжатия мог потерять, и коротко.
+    def plain(item, width=220):
+        # ссылки табло (относительно папки сессии) — путями от корня дерева: их можно сразу открыть
+        item = re.sub(r"\[([^\]]*)\]\((<[^>]+>|[^)]+)\)",
+                      lambda m: f"{m.group(1)} {rel(root, Path(link_target(board, m.group(2))))}"
+                      if not re.match(r"^<?[a-z]+://", m.group(2)) else f"{m.group(1)} {m.group(2).strip('<>')}",
+                      item)
+        return cut(item.replace("**", ""), width)
+
+    stage = b["stage"] + (f" · {b['stage_time']}" if b["stage_time"] else "")
+    out = [f"Контекст сжат. Табло сессии {rel(root, board)} — твоя память об этой работе: продолжай по нему, "
+           "переспрашивать пользователя не нужно. Верх табло:", ""]
+    for label, val in (("Тема", b["title"]), ("Задача", b["task"]), ("Сейчас", stage), ("Дальше", b["next"]),
+                       ("Зачем", b["why"])):
+        if val:
+            out.append(f"- {label}: {cut(val, 300)}")
+    if b["links"]:
+        out.append("- Смотреть: " + " · ".join(
+            f"{l} {t if re.match(r'^[a-z]+://', t) else rel(root, Path(t))}" for l, t in b["links"]))
+    stages = [f"{g['time']} {g['title']}" for g in b["history"][-5:] if g["title"]]
+    if len(stages) > 1:
+        out.append("- Этапы: " + " → ".join(stages))
+    sections = b["sections"]
+    for name, items in (("Решения", sections.get("Решения", [])[-6:]),
+                        ("Открытые находки", [i for i in sections.get("Находки", []) if i.startswith("⚠")][-5:]),
+                        ("Очередь", sections.get("Очередь", [])[-8:]),
+                        ("Итог", sections.get("Итог", [])[-4:])):
+        if items:
+            out += ["", f"{name}:"] + [f"- {plain(i)}" for i in items]
+    asks = [it for g in b["history"] for it in g["items"] if " 🗣 " in it][-5:]
+    if asks:
+        out += ["", "Последние просьбы пользователя (новые снизу; это начало его текста):"]
+        out += [f"- {plain(it, 300)}" for it in asks]
+    return "\n".join(out)
+
+
+def opened_file(cmd, out, cwd):
+    # Файл, который агент открыл пользователю вкладкой Orca: orca file open <путь>.
+    if not re.search(r"\borca\s+file\s+open\b", cmd):
+        return None
+    rp = re.search(r'"relativePath":\s*"([^"]+)"', out)
+    wt = re.search(r'"worktree":\s*"[^"]*::([^"]+)"', out)
+    if rp and wt:
+        return Path(wt.group(1)) / rp.group(1)
+    m = re.search(r"\borca\s+file\s+open\s+(\"[^\"]+\"|'[^']+'|\S+)", cmd)
+    if m:
+        p = Path(m.group(1).strip("\"'")).expanduser()
+        p = p if p.is_absolute() else Path(cwd) / p
+        return p if p.is_file() else None
+    return None
+
+
+def tool_now(tool, inp):
+    # Что агент делает этой командой — её описание (у Bash оно есть всегда), без вызова модели.
+    if tool == "Bash":
+        return inp.get("description") or cut(inp.get("command", "").splitlines()[0] if inp.get("command") else "", 80)
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        target = inp.get("file_path") or inp.get("notebook_path") or ""
+        return f"правит {Path(target).name}" if target else ""
+    return ""
+
+
+IMAGE_RE = re.compile(r"\.(?:png|jpe?g|webp|gif)$", re.IGNORECASE)
+
+
+def seen_frame(root, board, f, note=None, when=None):
+    # Кадр, который агент посмотрел (Read) или открыл пользователю, — в галерею вкладки, сам. Подпись — имя
+    # файла и то, что агент делал перед этим (описание его последней команды). Вставки пользователя пишет
+    # хук сообщения, копии из галереи не повторяются.
+    if not (IMAGE_RE.search(f.name) and f.is_file()) or f.name.startswith("orca-paste-") \
+            or "/.artifacts/gallery/" in str(f) or re.search(r"/claude-\d+/.+/images/", str(f)):
+        return
+    if note is None:
+        live = get_now(root)
+        note = live.get("text", "") if live.get("kind") == "tool" and time.time() - live.get("ts", 0) < 900 else ""
+    add_frame(root, board, f, frame_caption(f), note=note, when=when)
+
+
+def scan_seen(root, board, st, tp):
+    # Запасной путь к хуку Read: кадры, которые агент посмотрел, — по транскрипту с прошлого раза (после
+    # каждой команды и в конце хода). Работает и в сессиях, начатых до установки хука Read.
+    if not tp or not Path(tp).is_file():
+        return
+    size = Path(tp).stat().st_size
+    pos = (st.get("seen_pos") or {}).get(tp)
+    # первый раз — хвост побольше: картинки, которые агент смотрел, лежат в транскрипте целиком, по мегабайту
+    pos = max(size - (40 << 20), 0) if pos is None or pos > size else pos
+    with open(tp, "rb") as fh:
+        fh.seek(pos)
+        data = fh.read(size - pos)
+    end = data.rfind(b"\n") + 1
+    note = st.get("seen_note", "")
+    for line in data[:end].decode("utf-8", errors="ignore").splitlines():
+        if '"tool_use"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        msg = r.get("message") if r.get("type") == "assistant" and isinstance(r.get("message"), dict) else {}
+        for c in msg.get("content") or []:
+            if not isinstance(c, dict) or c.get("type") != "tool_use":
+                continue
+            inp = c.get("input") or {}
+            if c.get("name") == "Bash" and inp.get("description"):
+                note = inp["description"]
+            elif c.get("name") == "Read" and inp.get("file_path"):
+                seen_frame(root, board, Path(inp["file_path"]), note=note, when=local_hm(r.get("timestamp", "")))
+    st["seen_pos"], st["seen_note"] = {tp: pos + end}, note
+
+
+def opened_url(cmd):
+    # Страница, которую агент открыл во вкладке браузера Orca: orca tab create --url / orca goto --url.
+    if not re.search(r"\borca\s+(?:tab\s+create|goto)\b", cmd):
+        return None
+    m = re.search(r"--url[ =]+[\"']?(https?://[^\s\"']+)", cmd)
+    return m.group(1) if m else None
+
+
+def flush_log(b, st):
+    # Записи, отложенные до следующей записи табло (строки о коммитах), — на табло в их время.
+    for hm, icon, text in st.pop("pending_log", []):
+        place(b, f"**{hm}** {icon} {text}")
+
+
+def drop_slow_tool_hooks():
+    # Убрать из настроек Claude медленные хуки после каждого вызова инструмента. Их хозяева ставят их
+    # обратно (repowise init в новом проекте), поэтому — при каждом начале сессии. Хук repowise в начале
+    # сессии и его MCP остаются. Настройки переписываются, только когда есть что убрать.
+    try:
+        text = CLAUDE_SETTINGS.read_text(encoding="utf-8")
+        if not any(h in text for h in SLOW_TOOL_HOOKS):
+            return
+        s = json.loads(text)
+        groups = (s.get("hooks") or {}).get("PostToolUse") or []
+        kept = [g for g in ({**g, "hooks": [h for h in g.get("hooks", [])
+                                            if not any(x in h.get("command", "") for x in SLOW_TOOL_HOOKS)]}
+                            for g in groups) if g["hooks"]]
+        if kept == groups:
+            return
+        s["hooks"]["PostToolUse"] = kept
+        tmp = CLAUDE_SETTINGS.with_name(f".settings.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(s, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, CLAUDE_SETTINGS)
+    except Exception:
+        pass  # хук не должен мешать сессии: не вышло — уберём в следующий раз
+
+
+def hook(event):
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        data = {}
+    if event == "start":
+        drop_slow_tool_hooks()
+    root = worktree_root(data.get("cwd"))
+    if event == "pre":  # фоновый хук перед командой: только «что делаю сейчас», без замка и вывода
+        set_now(root, "tool", tool_now(data.get("tool_name", ""), data.get("tool_input") or {}))
+        return
+    with locked(root):
+        hook_locked(event, data, root)
+
+
+def hook_locked(event, data, root):
+    st = load_state(root)
+    board = current_board(root, st)
+    if data.get("transcript_path"):
+        st["transcript"] = data["transcript_path"]
+
+    if event == "prompt":
+        prompt = data.get("prompt") or ""
+        if prompt_kind(prompt) != "human":
+            return  # сообщение другой вкладки или фоновой задачи — не просьба пользователя
+        if board:
+            log_recaps(board, st, data.get("transcript_path"))
+        record_prompt(root, board, st, data)
+        st.update(last_prompt_ts=time.time(), last_prompt_len=len(prompt.strip()), turn_changed=False,
+                  last_human_ts=time.time(), session_id=data.get("session_id"))
+        save_state(root, st)
+        set_now(root, "prompt", "ваше сообщение — в работе")
+        if not board and len(prompt.strip()) >= 80:
+            hook_output("UserPromptSubmit",
+                        "Табло сессии не заведено — заведи его сейчас, до ответа: artifacts init \"<тема>\" "
+                        "(этап «Разбор»; скилл session-artifacts). Просьбы и кадры пользователя табло "
+                        "запишет само.")
+        return
+
+    if event == "start":
+        if board and st.get("pending_log"):  # коммиты прошлой сессии этой вкладки
+            b = parse(board)
+            flush_log(b, st)
+            save(board, b)
+        save_state(root, st)
+        brief = skill_brief()
+        if board and data.get("source") == "compact":
+            note = handoff_text(root, board, parse(board))
+        elif board:
+            b = parse(board)
+            note = (f"В этой вкладке уже есть табло сессии. Табло: {rel(root, board)} — сейчас «{b['stage']}». "
+                    "Продолжаешь ту работу — веди его; новая задача — artifacts init \"<тема>\".")
+        else:
+            note = ""
+        text = "\n\n".join(x for x in (f"Табло сессии (скилл session-artifacts):\n{brief}" if brief else "",
+                                       note) if x)
+        if text:
+            hook_output("SessionStart", text)
+        return
+
+    if event == "tool":
+        tool = data.get("tool_name", "")
+        inp = data.get("tool_input") or {}
+        if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            target = inp.get("file_path") or inp.get("notebook_path") or ""
+            if not (board and Path(target).resolve() == board.resolve()):
+                st["turn_changed"] = True
+                save_state(root, st)
+            return
+        if tool == "Read" and board:
+            seen_frame(root, board, Path(inp.get("file_path") or ""))
+            return
+        if tool != "Bash" or not board:
+            return
+        cmd = inp.get("command", "")
+        resp = data.get("tool_response")
+        out = (resp.get("stdout", "") + "\n" + resp.get("stderr", "")) if isinstance(resp, dict) else str(resp or "")
+        cwd = data.get("cwd") or root
+        b, changed = parse(board), False
+        if re.search(r"\bgit\b[^|;&]*\bcommit\b", cmd) and "--dry-run" not in cmd:
+            found = [(m.group(1), m.group(2), m.group(3).strip()) for m in
+                     re.finditer(r"^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,})\] (.+)$", out, re.MULTILINE)]
+            if not found:  # git commit -q ничего не печатает — свежие коммиты во всех папках команды
+                dirs = [cwd] + [os.path.expanduser(d.strip("\"'")) for d in
+                                re.findall(r"(?:\bcd|\bgit\s+-C)\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)", cmd)]
+                for d in dict.fromkeys(dirs):
+                    top = git(d, "rev-parse", "--show-toplevel") if os.path.isdir(d) else ""
+                    last = git(d, "log", "-1", "--format=%h%x09%ct%x09%s").split("\t", 2) if top else []
+                    if len(last) == 3 and time.time() - int(last[1]) < 120:
+                        branch = git(d, "branch", "--show-current")
+                        other = Path(top).resolve() != root.resolve()
+                        found.append((f"{Path(top).name} {branch}" if other else branch, last[0], last[2]))
+            # Строка о коммите — не в табло сразу, а при следующей записи: иначе дерево после коммита снова
+            # грязное и git switch / rebase отказываются (TASK-1011).
+            history = history_text(b) + "\n".join(x[2] for x in st.get("pending_log", []))
+            for branch, sha, subject in found:
+                if f"коммит {sha[:8]}" in history:
+                    continue
+                files = git(cwd, "show", "--name-only", "--format=", sha).splitlines()
+                if files and all(f.endswith(BOARD_NAMES) or f"/{SHOTS}/" in f or "/кадры/" in f for f in files):
+                    continue  # коммит одного табло
+                st.setdefault("pending_log", []).append([stamp(b), "●", f"коммит {sha[:8]} {subject} ({branch})"])
+                st["turn_changed"] = True
+                save_state(root, st)
+        if re.search(r"\bbacklog\b.*\btask\s+create\b", cmd):
+            m = re.search(r"(TASK-\d+(?:\.\d+)*)", out)
+            if m:
+                t = re.search(r"create\s+(?:\"([^\"]+)\"|'([^']+)')", cmd)
+                title = (t.group(1) or t.group(2)) if t else ""
+                add(b, "Заведено за сессию", f"{m.group(1)} {title}".strip())
+                log(b, "＋", f"на доску: {m.group(1)} {title}".strip())
+                changed = True
+        f = opened_file(cmd, out, cwd)
+        if f and f.resolve() != board.resolve():
+            target = str(f.resolve())
+            b["links"] = ([[f.stem, target]] + [l for l in b["links"] if l[1] != target])[:MAX_LINKS]
+            changed = True
+            if IMAGE_RE.search(f.name):
+                seen_frame(root, board, f)  # кадр, открытый пользователю, — и в галерею
+        url = opened_url(cmd)
+        if url:
+            origin = re.match(r"^[a-z]+://[^/?#]+", url).group(0)
+            label = re.sub(r"^https?://", "", origin)
+            b["links"] = ([[label, url]] + [l for l in b["links"] if not l[1].startswith(origin)])[:MAX_LINKS]
+            changed = True
+        if changed:
+            flush_log(b, st)
+            save(board, b)
+            st["turn_changed"] = True
+        scan_seen(root, board, st, data.get("transcript_path"))
+        save_state(root, st)
+        return
+
+    if event == "stop":
+        # Конец хода ничего не требует от агента: итог хода — в строку внизу, недостающие кадры
+        # пользователя — из транскрипта. Остановить ход можно только ради init, раз на сообщение.
+        if data.get("stop_hook_active"):
+            save_state(root, st)
+            return
+        set_now(root, "turn", first_sentence(data.get("last_assistant_message")))
+        if board:
+            recover_missing(root, board, st, data)
+            scan_seen(root, board, st, data.get("transcript_path"))
+        prompt_ts = st.get("last_prompt_ts", 0)
+        nag = (not board and (st.get("turn_changed") or st.get("last_prompt_len", 0) >= 80)
+               and st.get("init_nag_ts") != prompt_ts)
+        if nag:
+            st["init_nag_ts"] = prompt_ts
+        st["turn_changed"] = False
+        save_state(root, st)
+        if nag:
+            print(json.dumps({"decision": "block", "reason": "Табло сессии не заведено — заведи: artifacts "
+                              "init \"<тема>\" (просьбы и кадры пользователя оно подхватит само). Одна "
+                              "команда — и заканчивай ход."}, ensure_ascii=False))
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "init":
+        with locked(worktree_root()):
+            cmd_init(args)
+    elif cmd in ("ask", "stage", "next", "why", "link", "now", "queue", "problem", "fixed", "decision",
+                 "done") and args:
+        with locked(worktree_root()):
+            cmd_simple(cmd, list(args))
+    elif cmd == "shot":
+        with locked(worktree_root()):
+            cmd_shot(args)
+    elif cmd == "path":
+        print(require_board()[1])
+    elif cmd == "gallery":
+        root, board = require_board()
+        refresh_gallery(root, board)
+        print(gallery_dir(root, board) / "index.html")
+    elif cmd == "statusline":
+        cmd_statusline()
+    elif cmd == "hook" and args:
+        try:
+            hook(args[0])
+        except Exception as e:  # хук не должен ломать сессию
+            print(f"artifacts hook: {e}", file=sys.stderr)
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

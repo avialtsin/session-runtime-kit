@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grooming"
+  short_description: "Груминг доски и репозитория: разбор, уборка, новое поколение задач"
+  default_prompt: "Use $grooming to review the Backlog.md board and the repository, clean up, and open a new task generation."

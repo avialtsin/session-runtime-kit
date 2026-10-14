@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Context Pipeline"
+  short_description: "Compile current code context and checkpoints"
+  default_prompt: "Use $agent-context-pipeline to prepare a current task brief, evidence pack, and checkpoint for this repository."
