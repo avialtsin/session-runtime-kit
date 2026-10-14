@@ -1,4 +1,0 @@
-interface:
-  display_name: "Doctor repo"
-  short_description: "Проверка текущего репозитория на наши правила и правки по согласию"
-  default_prompt: "Use $doctor-repo to check this repository against our workspace rules, show me the report, and fix only what I approve."

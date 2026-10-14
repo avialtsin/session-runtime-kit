@@ -1,21 +1,21 @@
 ---
-name: grooming
+name: go-grooming
 description: |
   Груминг доски Backlog.md и репозитория: разобрать, что на доске живо, а что сделано, брошено,
   устарело или повторяется; убрать мёртвый код и ветки; свести живое в продуктовые проблемы и
   открыть новое поколение задач (TASK-N001…), а старые активные задачи отправить в архив со ссылкой
   на новые. Используй, когда пользователь пишет «груминг», «разбери доску», «на доске хаос»,
-  «почисти доску / репозиторий», «новое поколение задач», «непонятно, что живое», или /grooming.
-  Не используй для одной задачи или обычного планирования.
+  «почисти доску / репозиторий», «новое поколение задач», «непонятно, что живое», «go grooming»,
+  или /go-grooming. Не используй для одной задачи или обычного планирования.
 ---
 
-# grooming — груминг доски и репозитория
+# go-grooming — груминг доски и репозитория
 
 Груминг нужен, когда на доске хаос: много старых номеров, In Progress давно влито, непонятно, что
 живое. Каждый груминг открывает новое **поколение** задач: живое переписывается новыми задачами,
 старые активные уходят в архив со ссылкой на новые.
 
-Скрипт — `~/.agents/skills/grooming/scripts/generation.py`, запуск из корня репозитория.
+Скрипт — `~/.agents/skills/go-grooming/scripts/generation.py`, запуск из корня репозитория.
 
 ## Поколения
 
@@ -30,14 +30,14 @@ description: |
 - Префикс поколения (`G3-001`) не годится: Backlog.md 1.52 не даёт сменить `task_prefix` («Task prefix
   cannot be changed after initialization»), а смена в конфиге руками ломает поиск старых задач и
   номера подзадач (`TASK-G01-TASK-G01-001.01`).
-- Новые доски (скилл `create-repo`) заводятся сразу с якорем `TASK-1000`. На старой доске без якоря
+- Новые доски (скилл `go-create-repo`) заводятся сразу с якорем `TASK-1000`. На старой доске без якоря
   номера до 1000 — «до поколений», первый груминг открывает поколение 1 или следующее за
   наибольшим номером.
 - Архив CLI не видит: ни `task view`, ни `search`. Файлы лежат в `backlog/archive/tasks/` и читаются
   глазами. Поэтому новая задача должна быть самодостаточной, а не ссылкой «см. TASK-…».
 
 ```bash
-python3 ~/.agents/skills/grooming/scripts/generation.py status
+python3 ~/.agents/skills/go-grooming/scripts/generation.py status
 ```
 
 Покажет якоря, следующий номер, активные задачи по поколениям и предупредит, если поколение
@@ -108,8 +108,8 @@ python3 ~/.agents/skills/grooming/scripts/generation.py status
    нумеровали с `N001`:
 
    ```bash
-   python3 ~/.agents/skills/grooming/scripts/generation.py open --dry-run
-   python3 ~/.agents/skills/grooming/scripts/generation.py open --note "Открыто грумингом ДД.ММ.ГГГГ: sessions/<папка>."
+   python3 ~/.agents/skills/go-grooming/scripts/generation.py open --dry-run
+   python3 ~/.agents/skills/go-grooming/scripts/generation.py open --note "Открыто грумингом ДД.ММ.ГГГГ: sessions/<папка>."
    git add backlog/completed && git commit -m "chore(backlog): open generation N" && git push
    ```
 
@@ -124,8 +124,8 @@ python3 ~/.agents/skills/grooming/scripts/generation.py status
    ```
 
    ```bash
-   python3 ~/.agents/skills/grooming/scripts/generation.py retire --map <карта> --dry-run
-   python3 ~/.agents/skills/grooming/scripts/generation.py retire --map <карта> [--cascade]
+   python3 ~/.agents/skills/go-grooming/scripts/generation.py retire --map <карта> --dry-run
+   python3 ~/.agents/skills/go-grooming/scripts/generation.py retire --map <карта> [--cascade]
    ```
 
    Скрипт проверит, что старые задачи активны, а новые существуют, допишет заметку «Поколение N
@@ -144,7 +144,7 @@ python3 ~/.agents/skills/grooming/scripts/generation.py status
 `backlog/completed/task-N000 - Поколение-N-начало-нумерации.md` (`status: Done`): следующий номер CLI
 берёт от наибольшего в `tasks/` и `completed/`. Якорь — единственная ручная правка файлов доски, его не
 архивировать и не удалять. Когда доска запуталась или поколение подходит к 999 задачам, новое
-поколение открывает груминг — глобальный скилл `grooming`.
+поколение открывает груминг — глобальный скилл `go-grooming`.
 ```
 
 И строкой — текущее поколение и с какой даты, какие старые задачи оставлены живыми.

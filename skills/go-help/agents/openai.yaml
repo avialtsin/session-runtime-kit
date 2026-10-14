@@ -1,0 +1,4 @@
+interface:
+  display_name: "Go Help"
+  short_description: "Где мы и что дальше: доска, сессии, вкладки Orca, go-команды"
+  default_prompt: "Use $go-help to show where this project stands and which go- command fits next."

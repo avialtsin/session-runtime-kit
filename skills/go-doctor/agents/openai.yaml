@@ -1,0 +1,4 @@
+interface:
+  display_name: "Go Doctor"
+  short_description: "Машина и все проекты разом: установка, правила, скиллы, доски"
+  default_prompt: "Use $go-doctor to check the whole setup: session-runtime installation, rules, skills, tools and every project in Orca."

@@ -55,4 +55,4 @@ if [ ! -e "$HOME/.agents/skills/orca-cli" ]; then
 fi
 
 step "Готово"
-echo "Открой новую вкладку Orca, запусти codex в папке проекта и скажи «заведи репо» или «go mind»."
+echo "Открой новую вкладку Orca, запусти codex в папке проекта и скажи «go help»."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Go Create Repo"
+  short_description: "Завести пространство проекта: git, AGENTS.md, доска, сессии"
+  default_prompt: "Use $go-create-repo to create a new project workspace with AGENTS.md, Backlog.md board, sessions and code-context placeholders."

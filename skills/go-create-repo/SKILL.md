@@ -1,15 +1,15 @@
 ---
-name: create-repo
+name: go-create-repo
 description: |
   Заводит рабочее пространство проекта одной командой или дозаводит недостающее в существующем:
   git на main, AGENTS.md с симлинком CLAUDE.md, доска Backlog.md, папка sessions/ для исследований,
   место под контекст кода (agent-context-pipeline). По согласию — приватный репозиторий на GitHub и
   подключение в Orca. Используй, когда пользователь просит создать / завести / инициализировать
   репозиторий, проект или новое пространство, «завести доску в проекте», «привести проект к нашему
-  виду», или пишет /create-repo. Ничего не перезаписывает.
+  виду», «go create repo», «заведи репо», или пишет /go-create-repo. Ничего не перезаписывает.
 ---
 
-# create-repo — новое пространство проекта
+# go-create-repo — новое пространство проекта
 
 Скилл заводит то, что нужно каждому проекту, и не таскает в репозиторий содержимое глобальных
 инструментов: программа `backlog` и скилл `agent-context-pipeline` стоят на машине один раз, в проект
@@ -32,7 +32,7 @@ description: |
 ```
 
 Шаблоны — `templates/AGENTS.md` и `templates/README.md`. Генератор — `scripts/scaffold.py`.
-Пути — от папки скилла `~/.agents/skills/create-repo/`.
+Пути — от папки скилла `~/.agents/skills/go-create-repo/`.
 
 ## 1. Собрать сведения
 
@@ -66,13 +66,13 @@ git --version; python3 --version; backlog --version; repowise --version
 Папка не пустая — сначала прогон без записи, показать пользователю отчёт:
 
 ```bash
-python3 ~/.agents/skills/create-repo/scripts/scaffold.py --target <папка> --dry-run [остальные флаги]
+python3 ~/.agents/skills/go-create-repo/scripts/scaffold.py --target <папка> --dry-run [остальные флаги]
 ```
 
 Затем настоящий запуск:
 
 ```bash
-python3 ~/.agents/skills/create-repo/scripts/scaffold.py \
+python3 ~/.agents/skills/go-create-repo/scripts/scaffold.py \
   --target <абсолютный путь> \
   --name <имя> \
   --description "<что это>" \
@@ -103,7 +103,7 @@ Backlog.md. Правило работы с доской уже записано 
 Последние три цифры — задача, всё перед ними — поколение. Ключа номера у `backlog task create` нет,
 следующий номер — наибольший в `tasks/` и `completed/` плюс один, поэтому якорь — файл, а не команда.
 Правило записано в разделе «Доска задач» шаблона `AGENTS.md`. Следующие поколения открывает скилл
-`grooming`. Существующую доску генератор не трогает: поколения на ней откроет первый груминг.
+`go-grooming`. Существующую доску генератор не трогает: поколения на ней откроет первый груминг.
 
 ## 4. Проверить
 
